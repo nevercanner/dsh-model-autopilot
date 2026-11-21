@@ -567,8 +567,18 @@ export function createFailover({
     }
 
     const lastVerdict = attempts.filter((item) => !item.ok).at(-1)?.verdict
+    // 循环正常走完（没被 break）但总耗时已超预算时，也要算「预算耗尽」——
+    // 否则 maxModels 恰好等于候选数时，最后一轮跑完超时却报「所有候选均失败」，
+    // 措辞误导用户以为池里真没有能用的模型。
+    if (!budgetExhausted && Date.now() - startedAt > budgetMs) budgetExhausted = true
+    // 区分「预算耗尽」与「候选耗尽」：两者对用户的含义不同 ——
+    // 前者是「时间到了，不是因为没模型可用」，后者才是「池子里真没有能用的」。
+    const failCount = attempts.filter((item) => !item.ok).length
     const exhausted = new Error(
-      `model-autopilot: 所有候选模型均失败（${attempts.length} 次尝试，${attempts.filter((item) => !item.ok).length} 次失败）`
+      budgetExhausted
+        ? `model-autopilot: 换模型预算耗尽（已用 ${Date.now() - startedAt}ms / 上限 ${budgetMs}ms，` +
+            `${attempts.length} 次尝试，${failCount} 次失败）`
+        : `model-autopilot: 所有候选模型均失败（${attempts.length} 次尝试，${failCount} 次失败）`
     )
     exhausted.name = 'AutopilotExhaustedError'
     // 把最后一次失败的语义映射回宿主的错误码：这样 agent loop 的 retry 策略
@@ -579,6 +589,10 @@ export function createFailover({
     withExtra.attempts = attempts
     withExtra.cause = lastError
     withExtra.reason = reason
+    // 让调用方/面板能区分两种耗尽：reason 说明选型路径，budgetExhausted 说明是否时间到了。
+    withExtra.budgetExhausted = budgetExhausted
+    withExtra.elapsedMs = Date.now() - startedAt
+    withExtra.budgetMs = budgetMs
     throw exhausted
   }
 

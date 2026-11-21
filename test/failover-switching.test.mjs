@@ -688,6 +688,50 @@ test('总时间预算必须真正生效：超预算后立刻停止换模型（�
   assert.ok(elapsed < 3_000, `超预算后必须立刻停，实际用了 ${elapsed}ms`)
 })
 
+test('报错文案区分「预算耗尽」与「候选耗尽」', async () => {
+  // 候选耗尽：候选很少，很快试完
+  {
+    const { failover } = await setup({
+      models: { 'our-free-model': ['a'] },
+      behaviour: { 'our-free-model/a': { throw: { code: 'RATE_LIMIT', message: 'quota' } } },
+      config: { failover: { terminalFallback: false, maxRetriesPerModel: 0 } }
+    })
+    await assert.rejects(() => failover.run({ messages: [] }), (error) => {
+      assert.match(error.message, /所有候选模型均失败/, '候选耗尽应说「所有候选模型均失败」')
+      assert.equal(error.budgetExhausted, false)
+      return true
+    })
+  }
+
+  // 预算耗尽：每个候选都很慢，预算先到
+  // 注意 maxTotalMs 归一化下限是 5000ms，测试里必须让总耗时真的超过它。
+  {
+    const ids = Array.from({ length: 30 }, (_, i) => `m${String(i).padStart(2, '0')}`)
+    const { failover } = await setup({
+      models: { 'our-free-model': ids },
+      behaviour: Object.fromEntries(
+        ids.map((id) => [`our-free-model/${id}`, { delayMs: 700, throw: { code: 'RATE_LIMIT', message: 'quota' } }])
+      ),
+      config: {
+        failover: {
+          maxTotalMs: 5_000,
+          maxRetriesPerModel: 0,
+          retrySameModel: false,
+          backoff: { initialMs: 0, maxMs: 0, jitterRatio: 0 },
+          terminalFallback: false
+        }
+      }
+    })
+    await assert.rejects(() => failover.run({ messages: [] }), (error) => {
+      assert.match(error.message, /换模型预算耗尽/, '预算耗尽不该说「所有候选模型均失败」')
+      assert.equal(error.budgetExhausted, true)
+      assert.ok(typeof error.elapsedMs === 'number', '要带已用时')
+      assert.ok(typeof error.budgetMs === 'number', '要带上限')
+      return true
+    })
+  }
+})
+
 // ── 不再误报「所有候选均失败」 ───────────────────────────────────────────────
 
 test('前 7 个候选失败、第 8 个可用：不能报耗尽', async () => {
