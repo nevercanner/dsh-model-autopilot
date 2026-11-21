@@ -2,6 +2,7 @@ node_modules/
 *.log
 *.tmp-*
 .tmp-*
+*.bak
 
 # dsh-bus 本地会话名册（不进仓库）
 .dsh-bus/
