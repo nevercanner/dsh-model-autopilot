@@ -1,0 +1,9 @@
+# dsh-model-autopilot bundle patch.
+#
+# 一行 insert 即挂载 host 半身（模型池 + 探针 + 调度器）。
+# 浏览器半身（左侧栏入口）在后续阶段通过 package.json 的 dsh.client 声明，
+# 并绑定在 name 为裸包名的这一行上。
+- insert:
+    - id: model-autopilot
+      name: '@dsh-external/dsh-model-autopilot'
+      config: {}
