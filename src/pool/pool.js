@@ -83,14 +83,26 @@ export function createPool({ ctx, config, store, logger = console }) {
     // catalogFilter 关闭时 hiddenFromPicker 毫无意义（选择界面不做屏蔽），
     // 写下去只会攒出一堆「开启后一次性消失 N 条模型」的暗雷。
     const catalogEnabled = config.catalogFilter?.enabled === true
-    store.setModel(key, {
-      failCount: entry.failCount,
-      cooldownUntil: entry.cooldownUntil,
-      nextProbeAt: entry.nextProbeAt,
-      health: entry.health,
-      hiddenFromPicker: catalogEnabled ? entry.hiddenFromPicker === true : false,
-      lastProbe: entry.lastProbe
-    })
+    // 写盘失败**绝不能**冒泡：persist() 由 apply() 调用，而 apply() 在
+    // markFailure()/markSuccess() 里 —— 后者又位于 failover 的「模型尝试失败」
+    // catch 块内。写盘异常一旦冒泡，会穿透整个 run()，把「磁盘故障」当成致命
+    // 错误，切换链路当场断掉（用户看到的是「因为 disk full 而没切换」）。
+    // 状态仍在内存里，调度不受影响 —— 磁盘满只该丢一点持久化，不该停工。
+    try {
+      store.setModel(key, {
+        failCount: entry.failCount,
+        cooldownUntil: entry.cooldownUntil,
+        nextProbeAt: entry.nextProbeAt,
+        health: entry.health,
+        hiddenFromPicker: catalogEnabled ? entry.hiddenFromPicker === true : false,
+        lastProbe: entry.lastProbe
+      })
+    } catch (error) {
+      logger.warn?.(
+        `model-autopilot: 池状态写入失败（${entry.key}）：${failureOf(error).message}` +
+          '（状态仍在内存中，不影响调度）'
+      )
+    }
   }
 
   /**

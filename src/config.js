@@ -97,17 +97,16 @@ export const DEFAULT_CONFIG = Object.freeze({
   }),
   failover: Object.freeze({
     /**
-     * 一次请求最多尝试几个不同模型（含首个）。
+     * 单次请求最多扫描多少个候选（纯扫描上限）。
      *
-     * 语义：**不设硬上限，由 maxTotalMs 兜住**。真实的耗时上界是总时间预算，
-     * 池子再大也超不过它。取值由 maxTotalMs / firstFrameTimeoutMs 推导（见
-     * normalizeConfig），并作为**下限**：用户显式配更大的值时以用户为准。
+     * 与 `maxTotalMs` 分工：这里管「扫多少个」，那里管「花多久」。真正的护栏是
+     * `maxTotalMs` —— failover 每次挑候选前都会检查已用时间，所以慢失败
+     * （首帧挂满）会在 2-3 个候选后就 break，不会失控扫描。
      *
-     * 推导的意义：预算内能把「本该试完」的候选都试到，不会因为写死的小上限
-     * 提前截断（历史 bug：上限 6/20 时，前 N 个恰好全挂就直接报
-     * 『所有候选均失败』，而池里还有几十个可用模型）。
+     * 200 的由来：常见池规模 100~200（宿主里实测 199 条），给到 200 意味着
+     * 「快失败场景能试完整个池」，而慢失败由预算兜住。
      */
-    maxModels: 1000,
+    maxModels: 200,
     /**
      * 一次请求在「换模型」上的总时间预算。超过就停手并如实报耗尽。
      *
@@ -326,29 +325,25 @@ export function normalizeConfig(raw) {
         10 * 60_000,
         DEFAULT_CONFIG.failover.firstFrameTimeoutMs
       ),
-      // maxModels 由预算推导，并且是**下限**：用户显式配更大的值时以用户为准。
+      // maxModels = 「单次请求最多扫描多少个候选」的**纯扫描上限**。
       //
-      // 推导不能用「最坏情况」除：maxTotalMs / firstFrameTimeoutMs 假设每个候选
-      // 都耗尽满超时。实际绝大多数失败是**秒级甚至毫秒级**（限流、凭据失效、
-      // 网关快速 5xx），只有极少数才会挂到首帧超时。用最坏值除会得出 3 这种
-      // 数字 —— 前 3 个候选恰好全挂就直接报『所有候选均失败』，而池里还有
-      // 几十个可用模型。这正是历史 bug 的形态。
+      // 职责划分（不再用除法互相推）：
+      //   - maxModels   → 最多扫多少个候选（防候选爆炸）
+      //   - maxTotalMs  → 最多花多久（真正的护栏，由 failover 每次挑候选前检查）
       //
-      // 所以按「预算能容纳多少个**典型**失败」推导：取首帧超时的 1/4 作为典型
-      // 耗时，并设 8 为绝对下限（再少就失去了在池子里挑的能力）。
+      // 为什么不再按预算除法推导：那个模型假设「每个候选都付一次退避」，但退避
+      // 只在**同一模型重试之间**才付（maxRetriesPerModel>0 时才有）。在
+      // maxRetriesPerModel=0 的快失败场景里，每候选开销≈0，预算够试整个池，
+      // 推导却算出 30 → 60 个候选只试了 30 个就报耗尽，后面全没试。
+      //
+      // 所以：显式配置优先（上限语义，用户写 1 就只试 1 个）；未配置时给宽松的
+      // 默认扫描上限，由 maxTotalMs 兜住慢失败（30s 预算 / 10s 首帧 → 约 3 个
+      // 候选就 break）。
       maxModels: (() => {
-        const totalMs = num(failover.maxTotalMs, 5_000, 30 * 60_000, DEFAULT_CONFIG.failover.maxTotalMs)
-        const frameMs = num(
-          failover.firstFrameTimeoutMs,
-          1_000,
-          10 * 60_000,
-          DEFAULT_CONFIG.failover.firstFrameTimeoutMs
-        )
-        const typicalMs = Math.max(250, Math.floor(frameMs / 4))
-        const derived = Math.max(8, Math.min(200, Math.ceil(totalMs / typicalMs)))
-        if (failover.maxModels === undefined) return derived
-        const explicit = num(failover.maxModels, 1, 10_000, derived)
-        return Math.max(derived, explicit)
+        if (failover.maxModels !== undefined && failover.maxModels !== null) {
+          return num(failover.maxModels, 1, 10_000, 200)
+        }
+        return DEFAULT_CONFIG.failover.maxModels
       })(),
       backoff: {
         initialMs: num(backoff.initialMs, 0, 60_000, DEFAULT_CONFIG.failover.backoff.initialMs),
