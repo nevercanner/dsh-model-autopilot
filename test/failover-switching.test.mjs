@@ -64,6 +64,16 @@ function createFakeLlm(models, behaviour, { onStream } = {}) {
       onStream?.(key, options)
       const spec = behaviour[key] ?? 'ok'
       if (spec === 'throw') throw Object.assign(new Error('boom'), { code: 'SERVER' })
+      if (spec?.slowMs) {
+        // 首帧挂起 slowMs 之后才产出 —— 模拟「首帧超时」
+        return {
+          async *[Symbol.asyncIterator]() {
+            await new Promise((resolve) => setTimeout(resolve, spec.slowMs))
+            yield { type: 'text-delta', text: 'slow' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          }
+        }
+      }
       if (spec?.delayMs) {
         return {
           async *[Symbol.asyncIterator]() {
@@ -340,7 +350,11 @@ test('所有候选都不可用：抛出可诊断的错误，带尝试记录', as
     () => failover.run({ messages: [] }),
     (error) => {
       assert.equal(error.name, 'AutopilotExhaustedError')
-      assert.equal(error.code, 'INVALID_CREDENTIAL', '错误码要映射回宿主语义')
+      // v0.2.1 起 error.code 表达**耗尽原因**（与文案一一对应），
+      // 上游失败语义另存 lastVerdictCode，两者不能混淆。
+      assert.equal(error.code, 'AUTOPILOT_CANDIDATES_EXHAUSTED', '错误码要表达「候选耗尽」')
+      assert.equal(error.lastVerdictCode, 'INVALID_CREDENTIAL', '上游语义另存 lastVerdictCode')
+      assert.equal(error.budgetExhausted, false)
       assert.equal(error.attempts.length, 1)
       assert.match(error.message, /所有候选模型均失败/)
       return true
@@ -644,7 +658,12 @@ test('全部模型都截断：抛出带 MAX_TOKENS 的错误码', async () => {
 
   await assert.rejects(() => failover.run({ messages: [] }), (error) => {
     assert.equal(error.name, 'AutopilotExhaustedError')
-    assert.equal(error.code, 'MAX_TOKENS', '错误码要让宿主/用户看出是截断不是别的问题')
+    // v0.2.1 起 error.code 表达**耗尽原因**（与文案一一对应）：这里 2 个候选
+    // 都被截断且未超预算 → 候选耗尽。「是截断不是别的问题」这个语义放在
+    // lastVerdictCode 上。
+    assert.equal(error.code, 'AUTOPILOT_CANDIDATES_EXHAUSTED', '错误码要表达「候选耗尽」')
+    assert.equal(error.lastVerdictCode, 'MAX_TOKENS', '截断语义另存 lastVerdictCode')
+    assert.match(error.message, /所有候选模型均失败/)
     return true
   })
 })
@@ -688,8 +707,12 @@ test('总时间预算必须真正生效：超预算后立刻停止换模型（�
   assert.ok(elapsed < 3_000, `超预算后必须立刻停，实际用了 ${elapsed}ms`)
 })
 
-test('报错文案区分「预算耗尽」与「候选耗尽」', async () => {
-  // 候选耗尽：候选很少，很快试完
+test('报错文案区分「预算耗尽」与「候选耗尽」，且错误码一一对应', async () => {
+  const { EXHAUSTED_CODE } = await import('../src/failover/failover.js')
+  // 两个码必须不同 —— 否则调用方无法区分「时间不够」与「池里没模型」
+  assert.notEqual(EXHAUSTED_CODE.budget, EXHAUSTED_CODE.candidates)
+
+  // 候选耗尽：候选很少、很快试完，预算没用满
   {
     const { failover } = await setup({
       models: { 'our-free-model': ['a'] },
@@ -697,14 +720,16 @@ test('报错文案区分「预算耗尽」与「候选耗尽」', async () => {
       config: { failover: { terminalFallback: false, maxRetriesPerModel: 0 } }
     })
     await assert.rejects(() => failover.run({ messages: [] }), (error) => {
-      assert.match(error.message, /所有候选模型均失败/, '候选耗尽应说「所有候选模型均失败」')
+      assert.match(error.message, /所有候选模型均失败/, '文案说候选耗尽')
+      assert.equal(error.code, EXHAUSTED_CODE.candidates, '码必须是候选耗尽码')
       assert.equal(error.budgetExhausted, false)
+      // 最后一次失败的具体语义另存，不与耗尽原因混在一个字段
+      assert.equal(error.lastVerdictCode, 'RATE_LIMIT')
       return true
     })
   }
 
-  // 预算耗尽：每个候选都很慢，预算先到
-  // 注意 maxTotalMs 归一化下限是 5000ms，测试里必须让总耗时真的超过它。
+  // 预算耗尽：候选多、每步慢，预算先到
   {
     const ids = Array.from({ length: 30 }, (_, i) => `m${String(i).padStart(2, '0')}`)
     const { failover } = await setup({
@@ -723,13 +748,44 @@ test('报错文案区分「预算耗尽」与「候选耗尽」', async () => {
       }
     })
     await assert.rejects(() => failover.run({ messages: [] }), (error) => {
-      assert.match(error.message, /换模型预算耗尽/, '预算耗尽不该说「所有候选模型均失败」')
+      assert.match(error.message, /换模型预算耗尽/, '文案说预算耗尽')
+      assert.equal(error.code, EXHAUSTED_CODE.budget, '码必须是预算耗尽码')
       assert.equal(error.budgetExhausted, true)
       assert.ok(typeof error.elapsedMs === 'number', '要带已用时')
       assert.ok(typeof error.budgetMs === 'number', '要带上限')
       return true
     })
   }
+})
+
+test('慢失败仍受预算保护：首帧挂满时约 2-3 个候选就 break，不扫满 maxModels', async () => {
+  const { EXHAUSTED_CODE } = await import('../src/failover/failover.js')
+  const ids = Array.from({ length: 30 }, (_, i) => `s${String(i).padStart(2, '0')}`)
+  const { failover } = await setup({
+    models: { 'our-free-model': ids },
+    behaviour: Object.fromEntries(
+      ids.map((id) => [`our-free-model/${id}`, { slowMs: 11_000 }])
+    ),
+    config: {
+      failover: {
+        maxTotalMs: 30_000,
+        firstFrameTimeoutMs: 10_000,
+        maxRetriesPerModel: 0,
+        retrySameModel: false,
+        terminalFallback: false
+      }
+    }
+  })
+  const started = Date.now()
+  await assert.rejects(() => failover.run({ messages: [] }), (error) => {
+    // 首帧超时不原地重试，直接换下一个；10s 一个 → 30s 预算约试 3 个
+    assert.ok(error.attempts.length <= 5, `应在预算内 break，实际试了 ${error.attempts.length} 个`)
+    assert.equal(error.budgetExhausted, true)
+    assert.equal(error.code, EXHAUSTED_CODE.budget, '慢失败耗尽的是时间，码应是预算耗尽')
+    return true
+  })
+  const elapsed = Date.now() - started
+  assert.ok(elapsed < 40_000, `总耗时应在预算附近，实际 ${elapsed}ms`)
 })
 
 // ── 不再误报「所有候选均失败」 ───────────────────────────────────────────────

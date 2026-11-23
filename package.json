@@ -36,7 +36,8 @@
     "build": "bash scripts/build.sh",
     "test": "node --test \"test/*.test.mjs\"",
     "smoke": "node scripts/smoke.mjs",
-    "repair": "node scripts/repair-state.mjs"
+    "repair": "node scripts/repair-state.mjs",
+    "verify:exhaustion": "node scripts/verify-exhaustion-modes.mjs"
   },
   "dsh": {
     "bundle": {

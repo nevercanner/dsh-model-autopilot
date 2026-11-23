@@ -155,7 +155,12 @@ test('全部失败：抛出 AutopilotExhaustedError，并带上映射后的错�
     () => failover.run({ messages: [] }),
     (error) => {
       assert.equal(error.name, 'AutopilotExhaustedError')
-      assert.equal(error.code, 'SERVER')
+      // v0.2.1 起 error.code 表达**耗尽原因**（与文案一一对应）：
+      // 这里 3 个候选全失败且未超预算 → 候选耗尽；上游语义（SERVER）另存
+      // lastVerdictCode，供宿主 retry 策略使用。
+      assert.equal(error.code, 'AUTOPILOT_CANDIDATES_EXHAUSTED', '错误码要表达「候选耗尽」')
+      assert.equal(error.lastVerdictCode, 'SERVER', '上游语义另存 lastVerdictCode')
+      assert.equal(error.budgetExhausted, false)
       assert.equal(error.attempts.length, 3, '三个候选都要被试过（不能提前截断）')
       assert.ok(error.attempts.every((item) => item.ok === false))
       return true
