@@ -84,7 +84,15 @@ export const DEFAULT_CONFIG = Object.freeze({
     /** degraded 状态的基础降权（限流/超时仍可用，但排在健康条目后面）。 */
     degradedPenalty: 20,
     /** 每 1s 首帧延迟的降权。 */
-    latencyPenaltyPerSecond: 1,
+    /**
+     * 延迟惩罚系数（分/秒）。
+     *
+     * 为什么从 1 提到 12：原来 1 分/秒意味着一个 39 秒的通道只扣 39 分，而
+     * 「available」加 50 分、免费优先加 1000 分 —— 慢通道照样排最前，调度器
+     * 会反复挑它，用户看到的就是「一直等、一直失败」。12 分/秒让 39s 的通道
+     * 扣 468 分，稳定排到后面去（1~2s 的快通道只扣 12~24 分，不受影响）。
+     */
+    latencyPenaltyPerSecond: 12,
     /** 冷却已到期、等待复检的条目的加分（给恢复中的通道一次机会）。 */
     halfOpenBonus: 10,
     /**
@@ -154,6 +162,18 @@ export const DEFAULT_CONFIG = Object.freeze({
      * 超时按 timeout 处理并**直接换模型**（不原地重试，否则又白等一轮）。
      */
     firstFrameTimeoutMs: 10_000,
+    /**
+     * 预算收手后并发试探多少个候选（谁先响应就用谁）。
+     *
+     * 为什么并发而不是「挑一个最可能快的」：预算收手时，剩余候选里谁快
+     * **无从得知** —— 探针的延迟数据可能缺失，排序只能退化成 key 字典序，
+     * 于是会挑中一个慢通道再白等一轮（实测：挑中 a3 而不是 z-fast-ok，
+     * 把最后的希望也耗掉了）。并发试探是「尽可能多试候选直到拿到有效
+     * 响应」的直接实现。
+     *
+     * 上限 4：再多就同时打太多上游（免费通道按 session 计数配额）。
+     */
+    raceCandidates: 4,
     /** 重试退避。 */
     backoff: Object.freeze({ initialMs: 400, maxMs: 4_000, jitterRatio: 0.2 })
   }),
@@ -345,6 +365,7 @@ export function normalizeConfig(raw) {
         }
         return DEFAULT_CONFIG.failover.maxModels
       })(),
+      raceCandidates: num(failover.raceCandidates, 1, 16, DEFAULT_CONFIG.failover.raceCandidates),
       backoff: {
         initialMs: num(backoff.initialMs, 0, 60_000, DEFAULT_CONFIG.failover.backoff.initialMs),
         maxMs: num(backoff.maxMs, 0, 5 * 60_000, DEFAULT_CONFIG.failover.backoff.maxMs),

@@ -758,7 +758,7 @@ test('报错文案区分「预算耗尽」与「候选耗尽」，且错误码�
   }
 })
 
-test('慢失败仍受预算保护：首帧挂满时约 2-3 个候选就 break，不扫满 maxModels', async () => {
+test('慢失败：预算收手后仍并发试探一轮，总耗时有上限且报预算耗尽', async () => {
   const { EXHAUSTED_CODE } = await import('../src/failover/failover.js')
   const ids = Array.from({ length: 30 }, (_, i) => `s${String(i).padStart(2, '0')}`)
   const { failover } = await setup({
@@ -778,14 +778,65 @@ test('慢失败仍受预算保护：首帧挂满时约 2-3 个候选就 break，
   })
   const started = Date.now()
   await assert.rejects(() => failover.run({ messages: [] }), (error) => {
-    // 首帧超时不原地重试，直接换下一个；10s 一个 → 30s 预算约试 3 个
-    assert.ok(error.attempts.length <= 5, `应在预算内 break，实际试了 ${error.attempts.length} 个`)
+    // 语义变更（用户要求「除非完成任务，否则不中断」）：
+    // 预算收手后**仍要并发试探剩余候选**，所以尝试数会超过「预算内能试的 2-3 个」；
+    // 但并发批次受 raceCandidates 限制（默认 4），总数仍受控。
+    assert.ok(error.attempts.length <= 12, `尝试数应受控，实际 ${error.attempts.length} 个`)
     assert.equal(error.budgetExhausted, true)
     assert.equal(error.code, EXHAUSTED_CODE.budget, '慢失败耗尽的是时间，码应是预算耗尽')
+
+    // 并发性验证：同一批并发试探的候选，各自耗时应该接近（都是 ~10s）；
+    // 如果是串行等待，耗时会递增成 10s / 20s / 30s / 40s。
+    const racedAttempts = error.attempts.filter((item) => item.lastResort === true)
+    const latencies = racedAttempts.map((item) => item.latencyMs ?? 0).filter((ms) => ms > 0)
+    if (latencies.length >= 2) {
+      const spread = Math.max(...latencies) - Math.min(...latencies)
+      assert.ok(spread < 8_000, `并发试探的耗时应该接近（并行），实际跨度 ${spread}ms`)
+    }
     return true
   })
   const elapsed = Date.now() - started
-  assert.ok(elapsed < 40_000, `总耗时应在预算附近，实际 ${elapsed}ms`)
+  // 总耗时 = 预算（30s，循环里试了约 3 个慢候选）+ 并发试探一批（一次 10s）
+  // = 约 40s。**不是** 30s + 4×10s：并发试探是同时发出的，一批只花一次超时。
+  assert.ok(elapsed < 55_000, `总耗时应 ≈ 预算 + 一次并发试探，实际 ${elapsed}ms`)
+})
+
+test('预算耗尽后不中断任务：并发试探剩余候选，谁先响应就用谁', async () => {
+  const ids = ['a0', 'a1', 'a2', 'z-fast-ok']
+  const { failover, llm } = await setup({
+    models: { 'our-free-model': ids },
+    behaviour: Object.fromEntries(
+      ids.slice(0, 3).map((id) => [`our-free-model/${id}`, { slowMs: 30_000 }])
+    ),
+    config: {
+      failover: {
+        maxTotalMs: 5_000,
+        firstFrameTimeoutMs: 1_500,
+        maxRetriesPerModel: 0,
+        retrySameModel: false,
+        terminalFallback: false
+      }
+    }
+  })
+
+  const result = await failover.run({ messages: [] })
+  assert.equal(result.model.key, 'our-free-model/z-fast-ok', '应由并发试探挑到唯一能响应的候选')
+  assert.equal(result.reason, 'last-resort')
+})
+
+test('真的所有候选都失败时才抛错', async () => {
+  const { failover } = await setup({
+    models: { 'our-free-model': ['a', 'b'] },
+    behaviour: {
+      'our-free-model/a': { throw: { code: 'RATE_LIMIT', message: 'quota' } },
+      'our-free-model/b': { throw: { code: 'RATE_LIMIT', message: 'quota' } }
+    },
+    config: { failover: { terminalFallback: false, maxRetriesPerModel: 0 } }
+  })
+  await assert.rejects(() => failover.run({ messages: [] }), (error) => {
+    assert.equal(error.name, 'AutopilotExhaustedError')
+    return true
+  })
 })
 
 // ── 不再误报「所有候选均失败」 ───────────────────────────────────────────────

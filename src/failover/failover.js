@@ -271,6 +271,143 @@ function isSemanticChunk(chunk) {
 }
 
 /**
+ * 挑「最可能成功」的一个：池里健康、不在冷却、探针测过且**延迟最低**的条目。
+ *
+ * 用于预算收手后的最后一搏：按延迟排序意味着它是最快能给响应的通道，
+ * 比随机挑一个或直接报错都强。
+ *
+ * @param {any} pool
+ * @param {string[]} excluded
+ * @returns {import('../pool/types.js').ModelEntry | null}
+ */
+function pickFastestHealthy(pool, excluded) {
+  const now = Date.now()
+  const excludedSet = new Set(excluded)
+  const candidates = pool
+    .all()
+    .filter((entry) => !excludedSet.has(entry.key))
+    .filter((entry) => entry.health !== 'dead')
+    .filter((entry) => !(entry.cooldownUntil > now))
+    .filter((entry) => entry.lastProbe?.verdict === 'ok' || entry.health === 'available')
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => {
+    const aLatency = a.lastProbe?.latencyMs ?? Infinity
+    const bLatency = b.lastProbe?.latencyMs ?? Infinity
+    if (aLatency !== bLatency) return aLatency - bLatency
+    return (a.failCount ?? 0) - (b.failCount ?? 0)
+  })
+  return candidates[0]
+}
+
+/**
+ * 挑出「还没试过、且还有可能成功」的候选：不在本轮排除表里、没判死、
+ * 不在冷却中。
+ *
+ * 用于预算收手后的并发试探 —— 探针延迟数据可能缺失，没法预知谁快，
+ * 所以把还活着的机会全都拿出来一起试。
+ *
+ * @param {any} pool
+ * @param {string[]} excluded
+ * @returns {import('../pool/types.js').ModelEntry[]}
+ */
+function pickRemainingHealthy(pool, excluded) {
+  const now = Date.now()
+  const excludedSet = new Set(excluded)
+  return pool
+    .all()
+    .filter((entry) => !excludedSet.has(entry.key))
+    .filter((entry) => entry.health !== 'dead')
+    .filter((entry) => !(entry.cooldownUntil > now))
+    // 注意：**不要**再加「health === 'available' || lastProbe.verdict === 'ok'」。
+    // `unknown` 表示「从未探过」，不等于「不能用」—— 恰恰是最值得一试的候选。
+    // 加了那个条件会让预算收手时的并发试探把一个从没试过的健康通道也排除掉，
+    // 于是明明还有机会却直接报耗尽（实测：从未探过的快通道被过滤，测试报错）。
+    .sort((a, b) => {
+      // 探针测过的、延迟低的优先（能更快出声）；没数据的排后面。
+      const aLatency = a.lastProbe?.latencyMs ?? Infinity
+      const bLatency = b.lastProbe?.latencyMs ?? Infinity
+      if (aLatency !== bLatency) return aLatency - bLatency
+      return a.key.localeCompare(b.key)
+    })
+}
+
+/**
+ * 并发试探多个候选，谁先成功用谁，其余立刻中止。
+ *
+ * 每个候选一条独立的 AbortController：胜出后立刻 abort 其它，
+ * 不浪费上游额度（并发试的是同一批免费通道，多打一次就是多扣一次）。
+ *
+ * @param {any} ctx
+ * @param {any} pool
+ * @param {import('../pool/types.js').ModelEntry[]} contenders
+ * @param {any} call
+ * @param {number} timeoutMs
+ * @returns {Promise<{
+ *   winner: { entry: any, opened: any, latencyMs: number } | null,
+ *   results: Array<{ entry: any, ok: boolean, verdict?: string, latencyMs: number, raced: boolean }>
+ * }>}
+ */
+async function raceCandidates(ctx, pool, contenders, call, timeoutMs) {
+  /** @type {Array<{ entry: any, promise: Promise<any> }>} */
+  const running = contenders.map((entry) => {
+    const controller = new AbortController()
+    const callWithSignal = { ...call, signal: controller.signal }
+    const started = Date.now()
+    const promise = openWithPeek(ctx.llm, entry, callWithSignal, { timeoutMs })
+      .then((opened) => ({ entry, ok: true, opened, latencyMs: Date.now() - started, controller }))
+      .catch((error) => ({
+        entry,
+        ok: false,
+        verdict: /** @type {any} */ (error)?.verdict ?? classifyError(error),
+        latencyMs: Date.now() - started,
+        controller
+      }))
+    return { entry, promise }
+  })
+
+  /** @type {Array<{ entry: any, ok: boolean, verdict?: string, latencyMs: number, raced: boolean }>} */
+  const results = []
+  /** @type {any} */
+  let winner = null
+
+  // 逐个 await，但它们是**并发**跑的：第一个成功的立刻成为胜者。
+  for (const item of running) {
+    const settled = await item.promise
+    if (settled.ok) {
+      winner = settled
+      results.push({ entry: settled.entry, ok: true, latencyMs: settled.latencyMs, raced: true })
+      break
+    }
+    results.push({
+      entry: settled.entry,
+      ok: false,
+      verdict: settled.verdict,
+      latencyMs: settled.latencyMs,
+      raced: false
+    })
+  }
+
+  // 胜者已定：中止其余还在跑的探测。
+  for (const item of running) {
+    try {
+      item.promise.then(
+        (settled) => settled?.controller?.abort?.(),
+        () => {}
+      )
+    } catch {
+      /* 中止失败不影响主流程 */
+    }
+  }
+  // 记下被中止的候选（它们没成没败，只是输了这场竞速）。
+  for (const item of running) {
+    if (results.some((r) => r.entry.key === item.entry.key)) continue
+    results.push({ entry: item.entry, ok: false, latencyMs: 0, raced: false })
+  }
+
+  return { winner, results }
+}
+
+/**
  * 挑一个终极兜底模型：`config.failover.terminalFallback` 指定的通道里，
  * 挑一个没被排除、没判死、且不在冷却中的条目。
  *
@@ -406,19 +543,54 @@ export function createFailover({
     let reason = 'no-candidate'
     /** @type {unknown} */
     let lastError = null
-    /** 换模型的总时间预算：防止 20 个候选 × 30s 首帧超时把用户晾 10 分钟。 */
+    /**
+     * 换模型的总时间预算。
+     *
+     * 语义（重要）：**预算不是停止条件，是节奏调节器**。
+     * 用户的诉求是「除非完成任务，否则无感自动切换，不能因为预算耗尽就中断任务」。
+     * 所以预算只用来：
+     *   - 收缩后续候选的首帧超时（剩余时间越少，给下一个的耐心越短）；
+     *   - 在「剩余时间连一次快速失败都试不完」时收手（那才是真的没救了）。
+     * 绝不因为「用满了 30s」就抛错弃任务 —— 那正是用户要避免的「中断」。
+     */
     const startedAt = Date.now()
     const budgetMs = config.failover.maxTotalMs ?? 120_000
+    /**
+     * 单次候选至少还要有这么多剩余预算才值得试。
+     * 低于它就等于「明知来不及还硬上」—— 白等一轮，还让总耗时超支。
+     */
+    const MIN_USEFUL_MS = 1_500
+    /**
+     * 按剩余预算收缩单次候选的首帧超时。
+     *
+     * 为什么必须收缩：之前固定给 firstFrameTimeoutMs（10s），不看剩余预算。
+     * 预算 30s 时，前 3 个候选各挂满 10s 就已经 30s，第 4 个仍给满 10s →
+     * 实测总耗时 37191ms，超支 7s。
+     */
+    const attemptTimeout = () => {
+      const remaining = budgetMs - (Date.now() - startedAt)
+      const cap = config.failover.firstFrameTimeoutMs
+      // 下限不能超过上限：否则用户显式配 firstFrameTimeoutMs=1000 时，
+      // Math.max(1500, min(1000, ...)) = 1500 会把上限抬掉，
+      // 导致 1100ms 才响应的挂死候选被判成功（实测 B3 用例因此失败）。
+      const floor = Math.min(MIN_USEFUL_MS, cap)
+      return Math.max(floor, Math.min(cap, remaining))
+    }
     let budgetExhausted = false
 
     for (let index = 0; index < config.failover.maxModels; index += 1) {
       // 预算必须在**每次挑候选之前**查，而不是只在循环入口查一次。
       // 之前只在 index=0 时查，导致一次请求能跑 14 个候选、130s 才落点 ——
       // 用户在界面上看到的是「卡住」，其实是在一个接一个地等超时。
-      if (attempts.length > 0 && Date.now() - startedAt > budgetMs) {
+      //
+      // 剩余预算连「一次快速失败」都试不完时才收手 —— 这是唯一该停的理由。
+      // 不能因为「用满了预算」就停：用户的诉求是「除非完成任务，否则无感切换」。
+      // 收手后不抛「预算耗尽」，而是当「候选耗尽」处理（见下方 exhausted 构造）：
+      // 对用户来说任务没做完，语义上就是「没找到能用的模型」。
+      if (attempts.length > 0 && budgetMs - (Date.now() - startedAt) < MIN_USEFUL_MS) {
         budgetExhausted = true
         logger.warn?.(
-          `model-autopilot: 换模型已用 ${Date.now() - startedAt}ms，超过预算 ${budgetMs}ms，停止继续尝试`
+          `model-autopilot: 换模型已用 ${Date.now() - startedAt}ms，剩余预算不足 ${MIN_USEFUL_MS}ms，无法再试下一个`
         )
         break
       }
@@ -441,7 +613,7 @@ export function createFailover({
         const started = Date.now()
         try {
           const opened = await openWithPeek(ctx.llm, entry, call, {
-            timeoutMs: config.failover.firstFrameTimeoutMs
+            timeoutMs: attemptTimeout()
           })
           pool.markSuccess(entry.key)
           attempts.push({
@@ -534,6 +706,56 @@ export function createFailover({
       }
     }
 
+    // ── 最后一道：不因为预算就中断任务 ──────────────────────────────────────
+    //
+    // 用户的诉求：「除非完成任务，否则无感自动切换模型，不能因为预算耗尽就中断」。
+    // 预算收手（budgetExhausted）只说明「按常规耐心已经试完一轮了」，
+    // 不等于「没有可用模型」。所以这里再挑一次**最可能成功**的通道硬试：
+    // 池里探针测过、健康、不在冷却、且延迟最低的那条 —— 它是剩下最可能
+    // 在短时间内出响应的选项。多花几秒换「任务完成」是划算的。
+    if (budgetExhausted) {
+      // 并发试探所有剩余候选，谁先响应就用谁。
+      //
+      // 为什么要并发而不是「挑一个最可能快的」：预算收手时，剩余候选里谁快
+      // **无从得知** —— 探针的延迟数据可能缺失（从未探过 / 数据过期），排序只能
+      // 退化成 key 字典序，于是会挑中一个慢通道再白等一轮（实测：挑中 a3 而
+      // 不是 z-fast-ok，直接把最后的希望也耗掉了）。
+      //
+      // 用户诉求：「要在剩余预算内尽可能多试候选，直到拿到有效响应」—— 并发
+      // 试探是这句话的直接实现：所有候选同时发出，谁先出声就用谁，其余立刻
+      // 中止（不浪费上游额度）。
+      const contenders = pickRemainingHealthy(pool, excluded).slice(0, config.failover.raceCandidates)
+      if (contenders.length > 0) {
+        const raced = await raceCandidates(ctx, pool, contenders, call, config.failover.firstFrameTimeoutMs)
+        for (const record of raced.results) {
+          attempts.push({
+            key: record.entry.key,
+            ok: record.ok,
+            ...(record.ok ? {} : { verdict: record.verdict }),
+            retry: 0,
+            latencyMs: record.latencyMs,
+            terminal: true,
+            lastResort: true,
+            ...(record.raced ? { raced: true } : {})
+          })
+        }
+        if (raced.winner !== null) {
+          const winner = raced.winner
+          pool.markSuccess(winner.entry.key)
+          logger.info?.(
+            `model-autopilot: 预算收手后由 ${winner.entry.key} 接手完成（并发试探 ${contenders.length} 个）`
+          )
+          return {
+            stream: trackStream(pool, winner.entry, winner.opened.iterator, winner.opened.firstChunks),
+            model: winner.entry,
+            attempts,
+            fallbacks,
+            reason: 'last-resort'
+          }
+        }
+      }
+    }
+
     // ── 终极兜底 ────────────────────────────────────────────────────────────
     // 免费通道全试完了还不行，就用 terminalFallback（默认 deepseek-account）
     // 继续干。用户的诉求是「一直干活不停」：这时候抛错只会让会话停住或让宿主
@@ -545,7 +767,7 @@ export function createFailover({
         const started = Date.now()
         try {
           const opened = await openWithPeek(ctx.llm, fallbackEntry, call, {
-            timeoutMs: config.failover.firstFrameTimeoutMs
+            timeoutMs: attemptTimeout()
           })
           pool.markSuccess(fallbackEntry.key)
           attempts.push({
@@ -598,6 +820,11 @@ export function createFailover({
     if (!budgetExhausted && Date.now() - startedAt > budgetMs) budgetExhausted = true
     // 区分「预算耗尽」与「候选耗尽」：两者对用户的含义不同 ——
     // 前者是「时间到了，不是因为没模型可用」，后者才是「池子里真没有能用的」。
+    //
+    // 但**收尾语义**上有个重要区别：预算耗尽时任务还没做完，用户要的是
+    // 「继续干活」，所以最终抛出的错误码仍应是「候选耗尽」（= 没找到可用模型），
+    // 预算信息只作为附加字段给出。真正的「预算耗尽」码留给**预算检查点**触发
+    // 的那类场景（连一次快速失败都试不完，确实无路可走）。
     const failCount = attempts.filter((item) => !item.ok).length
     const exhausted = new Error(
       budgetExhausted
