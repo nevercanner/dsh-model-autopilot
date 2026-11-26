@@ -11,6 +11,7 @@
  * @module pool/pool
  */
 import { isFreeProvider, freeClassOf } from '../config.js'
+import { lookupByFamily, matchesProviderList } from './provider-id.js'
 import { entryKey } from './types.js'
 import { transition, transitionSuccess, transitionFailure, shouldHide } from './transitions.js'
 import { runLimited, failureOf, compact } from '../util.js'
@@ -148,14 +149,14 @@ export function createPool({ ctx, config, store, logger = console }) {
         const providerId = provider?.id
         if (typeof providerId !== 'string' || providerId === '') return
         // 本插件自己注册的虚拟 provider 必须排除在外（否则探测/调度会递归回自己）。
-        if (config.schedule.excludeProviders.includes(providerId)) {
+        if (matchesProviderList(providerId, config.schedule.excludeProviders)) {
           excludedProviders.push(providerId)
           return
         }
         const free = isFreeProvider(providerId, config)
         const priority = free
           ? config.free.priorityBonus
-          : (config.paid.priorities[providerId] ?? config.paid.defaultPriority)
+          : (lookupByFamily(providerId, config.paid.priorities) ?? config.paid.defaultPriority)
 
         /** @type {any[]} */
         let models = []

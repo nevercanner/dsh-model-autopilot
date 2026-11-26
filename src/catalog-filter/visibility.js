@@ -14,6 +14,7 @@
  * @module catalog-filter/visibility
  */
 import { AUTOPILOT_PROVIDER } from '../autopilot.js'
+import { providerFamily } from '../pool/provider-id.js'
 
 /**
  * @param {string} provider
@@ -25,8 +26,10 @@ import { AUTOPILOT_PROVIDER } from '../autopilot.js'
 export function filterModels(provider, models, pool, options = {}) {
   if (!Array.isArray(models) || models.length === 0) return models
 
-  const protectedProviders = new Set([AUTOPILOT_PROVIDER, ...(options.protectedProviders ?? [])])
-  if (protectedProviders.has(provider)) return models
+  const protectedProviders = new Set(
+    [AUTOPILOT_PROVIDER, ...(options.protectedProviders ?? [])].map((id) => providerFamily(id))
+  )
+  if (protectedProviders.has(providerFamily(provider))) return models
 
   const now = options.now ?? Date.now()
   /** @type {any[]} */

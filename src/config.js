@@ -9,6 +9,25 @@
  * @module config
  */
 import { DEFAULT_FREE_CHANNELS, matchesFreeChannel } from './pool/free-channels.js'
+import { lookupByFamily, matchesProviderList, providerFamily } from './pool/provider-id.js'
+
+/**
+ * 按量计费 / 账号类 provider：**无论 free.defaultFree 怎么配，都不算免费**。
+ *
+ * 为什么要在代码里兜这一层：`defaultFree: true`（白名单模式）的语义是
+ * 「paid.providers 之外一律免费」，它对**将来新接进来的 provider 同样生效**。
+ * 于是一接上官方 API Key（`deepseek-official`，按 token 计费）或宿主托管账号
+ * （`deepseek-account`），它们立刻被当成免费候选，插件就会拿真钱去「省免费额度」。
+ * 实测代价：deepseek-account 余额被点到 Insufficient Balance。
+ *
+ * 这条名单按 family 比对（`modlens-deepseek-account` 等价于 `deepseek-account`），
+ * 因此 modlens 转发出来的同一笔钱也拦得住。
+ * 真要放开，把它从 paid.providers 里删不掉 —— 得显式写进 `free.providers`（用户账号事实优先）。
+ */
+export const DEFAULT_IMPLIED_PAID_PROVIDERS = Object.freeze([
+  'deepseek-official',
+  'deepseek-account'
+])
 
 /** 全部默认值。改动这里等于改行为，测试里逐条断言。 */
 export const DEFAULT_CONFIG = Object.freeze({
@@ -62,6 +81,13 @@ export const DEFAULT_CONFIG = Object.freeze({
   paid: Object.freeze({
     /** 付费模型商 provider id 清单；为空表示“除免费之外全是付费”。 */
     providers: Object.freeze([]),
+    /**
+     * 按量计费/账号类 provider：永不判免费（defaultFree 模式也拦）。
+     * 对比 paid.providers —— 那份是「用户声明的付费清单」，这份是「代码级安全网」：
+     * 删掉 paid.providers 里的条目不会让这些账号变成免费，只有显式写进
+     * free.providers（或 free.channels）才放行。
+     */
+    impliedProviders: Object.freeze([...DEFAULT_IMPLIED_PAID_PROVIDERS]),
     /** 未单列的付费 provider 的默认优先级。 */
     defaultPriority: 0,
     /** 按 provider id 覆盖优先级，值越大越优先。 */
@@ -156,7 +182,9 @@ export const DEFAULT_CONFIG = Object.freeze({
      * 背后是一批互不相干的免费渠道）里，一个模型挂了不代表别的也挂 —— 整体跳过
      * 会把本来能用的通道砍掉。
      */
-    gatewayProviders: Object.freeze(['our-free-model', 'our-free-model-region', 'modlens-our-free-model']),
+    // 2026-11-26: our-free-model 系列已隔离出本机，原网关名单清空。
+    // 若将来重新接入多上游网关，把它的 provider id 加回这里。
+    gatewayProviders: Object.freeze([]),
     /**
      * 终极兜底通道：所有候选都失败后，**再用这个通道继续干**，而不是抛错停住。
      *
@@ -280,6 +308,25 @@ function strings(value) {
 }
 
 /**
+ * 合并两份 id 名单，保留先出现的顺序、按 family 去重后的字面值。
+ * @param {readonly string[]} base
+ * @param {readonly string[]} extra
+ * @returns {string[]}
+ */
+function mergeUnique(base, extra) {
+  /** @type {string[]} */
+  const out = []
+  const seen = new Set()
+  for (const item of [...base, ...extra]) {
+    const family = providerFamily(item)
+    if (family === '' || seen.has(family)) continue
+    seen.add(family)
+    out.push(item)
+  }
+  return out
+}
+
+/**
  * @param {unknown} value
  * @returns {Record<string, number>}
  */
@@ -354,6 +401,9 @@ export function normalizeConfig(raw) {
     },
     paid: {
       providers: strings(paid.providers),
+      // 用户可以追加更多「永不判免费」的账号类 provider；内置的那两条始终保留，
+      // 否则一次配置改动就能把安全网拆掉（欠费事故就是这么来的）。
+      impliedProviders: mergeUnique(DEFAULT_IMPLIED_PAID_PROVIDERS, strings(paid.impliedProviders)),
       defaultPriority: num(paid.defaultPriority, -100_000, 100_000, DEFAULT_CONFIG.paid.defaultPriority),
       priorities: priorities(paid.priorities)
     },
@@ -478,22 +528,29 @@ export function normalizeConfig(raw) {
 /**
  * 免费通道判定，带判定依据（写入池快照，便于审计为什么某条算免费）。
  *
- * 优先级：
+ * 优先级（越靠前越硬）：
  *   1. paid.providers 显式排除（用户的账号事实优先于我们的默认名单）
  *   2. free.providers 显式包含
- *   3. free.channels 已知免费通道（含 modlens- 前缀剥离）
- *   4. free.patterns 片段兜底
+ *   3. paid.impliedProviders 按量计费安全网（defaultFree 也拦不住它）
+ *   4. free.channels 已知免费通道（含 modlens- 前缀剥离）
+ *   5. free.patterns 片段兜底
+ *   6. free.defaultFree 白名单模式兜底
+ *
+ * 所有 provider 名单都用 **family 归一化**比对（`modlens-<渠道>` ≡ `<渠道>`）：
+ * 精确字符串比较会让 `modlens-deepseek-account` 绕过 `deepseek-account` 的付费/排除规则，
+ * 那是把付费账号当免费烧的直接原因。
  *
  * @param {string} provider
  * @param {ReturnType<typeof normalizeConfig>} config
- * @returns {'config' | 'channel' | 'pattern' | null} 命中来源，null = 付费
+ * @returns {'config' | 'channel' | 'pattern' | 'default' | null} 命中来源，null = 付费
  */
 export function freeClassOf(provider, config) {
-  if (config.paid.providers.includes(provider)) return null
-  if (config.free.providers.includes(provider)) return 'config'
+  if (matchesProviderList(provider, config.paid.providers)) return null
+  if (matchesProviderList(provider, config.free.providers)) return 'config'
+  if (matchesProviderList(provider, config.paid.impliedProviders)) return null
   if (matchesFreeChannel(provider, config.free.channels)) return 'channel'
-  const lowered = provider.toLowerCase()
-  if (config.free.patterns.some((pattern) => lowered.includes(pattern.toLowerCase()))) return 'pattern'
+  const lowered = providerFamily(provider)
+  if (config.free.patterns.some((pattern) => lowered.includes(pattern.trim().toLowerCase()))) return 'pattern'
   // 白名单模式：paid.providers 就是全部付费通道，其余一律免费。
   // 用于「除 minimax-cn / deepseek-account 外都是免费额度」的场景，
   // 不必逐个维护免费名单。
@@ -515,7 +572,8 @@ export function freeClassOf(provider, config) {
  * @returns {boolean}
  */
 export function hasFreeQuota(provider, quota) {
-  const info = quota?.providers?.[provider]
+  // 精确 id 优先，其次按 family 找（额度情报按渠道记账，modlens 变体共用同一份额度）。
+  const info = lookupByFamily(provider, quota?.providers ?? null)
   return Boolean(info && info.hasUsableQuota)
 }
 

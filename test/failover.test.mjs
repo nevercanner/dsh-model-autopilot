@@ -78,10 +78,19 @@ async function setup(behaviour, cfg = {}, modelsOverride = null) {
     magpie: ['paid-x']
   }
   const llm = createFakeLlm(models, behaviour)
-  const config = normalizeConfig({
-    failover: { maxModels: 3, maxRetriesPerModel: 1, retrySameModel: true, backoff: { initialMs: 0, maxMs: 0, jitterRatio: 0 } },
-    ...cfg
-  })
+  // our-free-model 是多渠道路由网关：同 provider 下每个模型各自路由到不同上游。
+  // 它的渠道已从默认 gatewayProviders 移除（2026-11-26 隔离出本机），夹具显式声明，
+  // 否则账号级跳过会把同通道的其它车道一起砍掉。其余 failover 字段语义不变。
+  const failoverConfig = cfg.failover
+    ? { gatewayProviders: ['our-free-model'], ...cfg.failover }
+    : {
+        maxModels: 3,
+        maxRetriesPerModel: 1,
+        retrySameModel: true,
+        backoff: { initialMs: 0, maxMs: 0, jitterRatio: 0 },
+        gatewayProviders: ['our-free-model']
+      }
+  const config = normalizeConfig({ ...cfg, failover: failoverConfig })
   const pool = createPool({ ctx: { llm }, config, store: createFakeStore(), logger })
   await pool.reload()
   const scheduler = createScheduler({ pool, config, logger })

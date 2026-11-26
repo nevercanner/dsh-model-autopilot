@@ -6,10 +6,14 @@ import assert from 'node:assert/strict'
 import { normalizeConfig, isFreeProvider, freeClassOf } from '../src/config.js'
 import { matchesFreeChannel } from '../src/pool/free-channels.js'
 
-test('我们的免费车道与 modlens 转发都算免费', () => {
+test('our-free-model 已从免费名单移除（2026-11-26 隔离出本机）', () => {
+  // 用户把 our-free-model 系列隔离出本机后，渠道本体仍在但不再随插件回装，
+  // 免费名单里随之移除。它既不是已知免费通道、也不命中 'free' 片段
+  // （'our-free-model' 本身含 free 字样，但名单移除后仍会被 patterns 判免费 ——
+  //  所以这里断言的是**名单层面**的移除，patterns 兜底仍可能让它算免费）。
   const config = normalizeConfig({})
-  assert.equal(isFreeProvider('our-free-model', config), true)
-  assert.equal(isFreeProvider('modlens-our-free-model', config), true)
+  const channelHit = matchesFreeChannel('our-free-model')
+  assert.equal(channelHit, false, 'our-free-model 不应再命中已知免费通道名单')
 })
 
 test('our-free-model 的账号渠道算免费（id 里没有 free 字样）', () => {

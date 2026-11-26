@@ -139,15 +139,20 @@ async function setup(options = {}) {
     magpie: ['paid-x']
   }
   const llm = createFakeLlm(models, options.behaviour ?? {}, { onStream: options.onStream })
-  const config = normalizeConfig({
-    failover: {
-      maxModels: 3,
-      maxRetriesPerModel: 1,
-      retrySameModel: true,
-      backoff: { initialMs: 0, maxMs: 0, jitterRatio: 0 }
-    },
-    ...(options.config ?? {})
-  })
+  const base = options.config ?? {}
+  // our-free-model 是多渠道路由网关（同 provider 下各模型独立上游）。
+  // 默认名单已随「隔离出本机」清空，夹具这里显式声明，保持网关语义可回归；
+  // 其余 failover 字段的语义保持不变（传了就整套覆盖，没传走窄基线）。
+  const failoverConfig = base.failover
+    ? { gatewayProviders: ['our-free-model'], ...base.failover }
+    : {
+        maxModels: 3,
+        maxRetriesPerModel: 1,
+        retrySameModel: true,
+        backoff: { initialMs: 0, maxMs: 0, jitterRatio: 0 },
+        gatewayProviders: ['our-free-model']
+      }
+  const config = normalizeConfig({ ...base, failover: failoverConfig })
   const pool = createPool({ ctx: { llm }, config, store: createFakeStore(), logger })
   await pool.reload()
   const scheduler = createScheduler({ pool, config, logger, preference: options.preference ?? null })
@@ -493,8 +498,11 @@ test('免费通道全失败后落到 deepseek-account 继续，不抛错', async
   )
 })
 
-test('兜底不受 allowPaid 限制（免费全挂时付费通道照样用）', async () => {
-  const { failover } = await setup({
+test('兜底受 allowPaid 约束：allowPaid=false 时不用付费兜底', async () => {
+  // 语义修正（2026-11-27）：兜底通道过去硬编码不受 allowPaid 限制，于是
+  // 「永不全落到付费」的配置在免费池耗尽时仍会偷偷调用付费账号 —— 实测把
+  // deepseek-account 余额点到 Insufficient Balance。现在兜底与普通候选同一把锁。
+  const { failover, llm } = await setup({
     models: {
       'our-free-model': ['free-a'],
       'deepseek-account': ['deepseek-flash']
@@ -508,9 +516,38 @@ test('兜底不受 allowPaid 限制（免费全挂时付费通道照样用）', 
     }
   })
 
-  // allowPaid=false 时正常候选只剩免费；免费挂了仍要兜底
+  await assert.rejects(
+    () => failover.run({ messages: [] }),
+    (error) => {
+      assert.equal(error.name, 'AutopilotExhaustedError')
+      assert.ok(
+        !llm.calls.includes('deepseek-account/deepseek-flash'),
+        `allowPaid=false 时不该碰付费兜底，实际调用链：${llm.calls.join(' → ')}`
+      )
+      return true
+    }
+  )
+})
+
+test('allowPaid=true 时兜底照旧生效（免费全挂也能继续干活）', async () => {
+  const { failover } = await setup({
+    models: {
+      'our-free-model': ['free-a'],
+      'deepseek-account': ['deepseek-flash']
+    },
+    behaviour: {
+      'our-free-model/free-a': { throw: { code: 'MISSING_CREDENTIAL', message: 'no key' } }
+    },
+    config: {
+      // 只给一个普通候选名额：deepseek-account 不参与普通候选，只能靠兜底进场
+      schedule: { allowPaidByDefault: true },
+      failover: { maxModels: 1, terminalFallback: { provider: 'deepseek-account', model: null } }
+    }
+  })
+
   const result = await failover.run({ messages: [] })
   assert.equal(result.model.key, 'deepseek-account/deepseek-flash')
+  assert.equal(result.reason, 'terminal-fallback')
 })
 
 test('兜底也失败时才抛错（并带上完整尝试链）', async () => {
@@ -524,9 +561,12 @@ test('兜底也失败时才抛错（并带上完整尝试链）', async () => {
       'deepseek-account/deepseek-flash': { throw: { code: 'MISSING_CREDENTIAL', message: 'no key' } }
     },
     config: {
-      // 关掉付费普通候选，让 deepseek-account 只能靠兜底进入 → 兜底那次才会被记录
-      schedule: { allowPaidByDefault: false },
-      failover: { terminalFallback: { provider: 'deepseek-account', model: null } }
+      // 只给一个普通候选名额（maxModels=1），让 deepseek-account 只能靠兜底进入
+      // → 尝试链里的 terminal 标记才会出现在它身上。
+      // 注意不能再用 excludeProviders 制造「只能靠兜底」的局面：兜底现在服从
+      // 排除名单（排除 deepseek-account 后兜底也不会用它）。
+      schedule: { allowPaidByDefault: true },
+      failover: { maxModels: 1, terminalFallback: { provider: 'deepseek-account', model: null } }
     }
   })
 

@@ -52,7 +52,11 @@ const FEATURE_MARKS = [
   { file: 'config.js', mark: 'v4FlashFreeBonus', why: 'v4 flash 免费加分' },
   { file: 'config.js', mark: 'v4FlashPaidBonus', why: 'v4 flash 付费加分' },
   { file: 'schedule/scoring.js', mark: 'V4_FLASH_RE', why: 'v4 flash 命名变体正则' },
-  { file: 'pool/free-channels.js', mark: 'openference', why: 'openference 免费通道' }
+  { file: 'pool/free-channels.js', mark: 'matchesFreeChannel', why: '免费通道判定入口（名单只认命中，不做子串猜测）' },
+  { file: 'pool/provider-id.js', mark: 'matchesProviderList', why: 'provider family 归一化（modlens 变体不漏网）' },
+  { file: 'pool/provider-id.js', mark: 'familyIndex', why: 'providerOrder 置顶按 family 匹配' },
+  { file: 'config.js', mark: 'impliedProviders', why: '按量计费 provider 永不判免费（defaultFree 也拦）' },
+  { file: 'failover/failover.js', mark: 'allowPaidNow', why: '付费兜底受 allowPaid 约束' }
 ]
 
 const failures = []
