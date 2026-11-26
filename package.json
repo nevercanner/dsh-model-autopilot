@@ -34,9 +34,10 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
-    "test": "node --test \"test/*.test.mjs\"",
+    "test": "node --test \"test/*.test.mjs\" && node scripts/verify-build-sync.mjs",
     "smoke": "node scripts/smoke.mjs",
     "repair": "node scripts/repair-state.mjs",
+    "verify:sync": "node scripts/verify-build-sync.mjs",
     "verify:exhaustion": "node scripts/verify-exhaustion-modes.mjs"
   },
   "dsh": {

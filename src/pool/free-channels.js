@@ -49,7 +49,10 @@ export const DEFAULT_FREE_CHANNELS = Object.freeze([
   'agnes',
   'siliconflow',
   'bailian',
-  'zhipu'
+  'zhipu',
+  // OpenInference：DeepSeek 模型限时免费至 12-31
+  'openference'
+  
 ])
 
 /** modlens 转发前缀：`modlens-our-free-model` 等价于 `our-free-model`。 */

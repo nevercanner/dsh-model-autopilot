@@ -20,10 +20,70 @@
  * @param {ScoreContext} context
  * @returns {number}
  */
+/**
+ * deepseek v4 flash 的模型名匹配。
+ *
+ * 为什么要放宽：不同通道的 v4 flash 命名不一致 ——
+ *   our-free-model      : `deepseek-v4-flash`
+ *   workbuddy           : `deepseek-v4.1-flash`（带小版本号 .1）
+ *   展示名（大小写）      : `Deepseek-V4.1-Flash`
+ * 原来的 `/v4[-_.]?flash/` 匹配不到 `v4.1-flash`（中间多了 `.1`），
+ * 结果 workbuddy 侧的 v4 flash 一直拿不到加分、排在免费组后面。
+ *
+ * 现在允许 `v4` 与 `flash` 之间出现任意版本后缀：`v4-flash` / `v4.1-flash` /
+ * `v4_2_flash` 都命中；同时排除 `v4-pro` 这类非 flash 型号。
+ */
+/**
+ * deepseek v4 flash 系列的模型名匹配。
+ *
+ * 为什么要这么宽：不同通道的 v4 flash 命名完全不统一，实测（our-free-model 的
+ * registry.json 里有 1000+ 条模型 id）至少存在这些形态：
+ *
+ *   deepseek-v4-flash              连字符
+ *   deepseek-v4.1-flash            带小版本号（workbuddy 用的就是这个）
+ *   deepseek-v4-flash-free         带 free 后缀
+ *   deepseek-v4.1-flash:cloud      带 :cloud 标签
+ *   deepseek/deepseek-v4-flash     带 vendor 前缀路径
+ *   deepseek-ai/DeepSeek-V4-Flash  vendor 前缀 + 大写
+ *   cline-pass/deepseek-v4-flash   渠道前缀
+ *   DeepSeek V4 Flash              **空格**分隔 + 首字母大写
+ *   DeepSeek V4.1 Flash            空格 + 点号
+ *   DeepSeek V4 Flash 0731         空格 + 数字后缀
+ *   DeepSeek V4 Flash (ClinePass)   空格 + 括号后缀
+ *   DeepSeek V4 Flash Vision (Exp) 空格 + vision 变体
+ *
+ * 所以规则是：deepseek 与 v4 之间、v4 与 flash 之间都允许任意分隔符
+ * （空格 / 点 / 连字符 / 下划线），v4 之后允许跟版本号。
+ *
+ * 刻意**不**匹配：
+ *   deepseek-v4-pro / V4 Pro      —— pro 不是 flash
+ *   deepseek-flash                —— 没有 v4
+ *   deepseek-chat / reasoner      —— 其它型号
+ *   morph-dsv4flash               —— 那是 Morph 自己的模型，不是 DeepSeek 的
+ *   glm-5.3-flash / gemini-*      —— 别的厂商
+ */
+const V4_FLASH_RE = /deepseek[\s._-]*v4(?:[\s._-]*\d+(?:[\s._-]\d+)*)?[\s._-]*flash/i
+
 export function scoreEntry(entry, context) {
   const { now, config, quota } = context
   const rules = config.schedule
   let score = entry.priority
+
+  // deepseek v4 flash 优先消耗。
+  //
+  // 分两档：免费渠道拿满额，付费渠道拿一半。
+  //
+  // 为什么付费渠道也加分：workbuddy 的 deepseek-v4.1-flash 在插件眼里是**付费**
+  // 条目（provider 不在免费名单里，走的是订阅/credits 计费），但它是用户想优先
+  // 用掉的那一档。而成本分组是 **provider 级**的（pool.js 里 cost 由 provider 决定，
+  // 不看单模型 billing.free），所以「免费 v4 flash 置顶」这条规则如果只在免费组
+  // 生效，workbuddy 侧的 v4 flash 就永远拿不到加分 —— 这正是之前它排在后面的原因。
+  //
+  // 免费拿满、付费拿半，是为了不破坏「免费优先于付费」这条硬规则：付费条目的
+  // 基础分本来就低（无 priorityBonus），半额加分不足以让它越过任何可用的免费模型。
+  if (V4_FLASH_RE.test(entry.model)) {
+    score += entry.cost === 'free' ? rules.v4FlashFreeBonus : rules.v4FlashPaidBonus
+  }
 
   if (entry.health === 'available') score += 50
   else if (entry.health === 'degraded') score -= rules.degradedPenalty
@@ -40,10 +100,6 @@ export function scoreEntry(entry, context) {
 
   // 额度情报：现在有免费额度的通道优先消耗；额度已截止的降权。
   score += quotaScore(entry, quota)
-
-  // 免费 flash 通道优先（用户口径：免费的里优先 deepseek v4 flash，
-  // 但保底付费通道 deepseek-account 要在最后才用）。
-  score += preferFlashScore(entry, config)
 
   // 输出被 max_tokens 截断过：说明这个通道的输出预算不够用。
   // 不判失败（模型没坏），但让位给能写完整回答的模型。
@@ -93,37 +149,6 @@ export function quotaScore(entry, quota) {
   if (info.hasUsableQuota) return 30
   if (info.expired) return -30
   return 0
-}
-
-/**
- * 是不是「优先用的免费 flash 通道」。
- *
- * 用户口径：「免费的也优先用 deepseek v4 flash 的，然后除了 deepseek-account 的，
- * 其他的都在这个范围内」——
- *   - 必须 `cost === 'free'`（不花钱）
- *   - provider 不能是 `deepseek-account`（那是保底付费通道，要留在最后）
- *   - 模型名命中 deepseek + v4 + flash
- *
- * 为什么要单独一档而不是只调 priority：priority 只影响组内相对顺序，
- * 而这里要的是「免费组里，这批排在其它免费通道之前」—— 用加成实现，
- * 既不动 probe 的优先级配置，也不影响付费组。
- *
- * @param {import('../pool/types.js').ModelEntry} entry
- * @param {{ schedule?: { preferFlash?: { enabled?: boolean, providers?: readonly string[], bonus?: number } } }} config
- * @returns {number} 命中时返回加成值，否则 0
- */
-export function preferFlashScore(entry, config) {
-  const rule = config?.schedule?.preferFlash
-  if (!rule || rule.enabled === false) return 0
-  // 保底通道不参与优先：它要在最后才用。
-  const blocked = rule.providers ?? []
-  if (blocked.includes(entry.provider)) return 0
-  if (entry.cost !== 'free') return 0
-  const name = `${entry.model ?? ''}`.toLowerCase()
-  if (!name.includes('deepseek')) return 0
-  if (!/v?4(\.\d+)?/.test(name)) return 0
-  if (!name.includes('flash')) return 0
-  return typeof rule.bonus === 'number' ? rule.bonus : 0
 }
 
 /**
