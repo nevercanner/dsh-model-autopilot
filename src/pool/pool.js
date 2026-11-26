@@ -10,7 +10,7 @@
  *
  * @module pool/pool
  */
-import { isFreeProvider, freeClassOf } from '../config.js'
+import { isFreeProvider, freeClassOf, freeChannelInfo } from '../config.js'
 import { lookupByFamily, matchesProviderList } from './provider-id.js'
 import { entryKey } from './types.js'
 import { transition, transitionSuccess, transitionFailure, shouldHide } from './transitions.js'
@@ -242,6 +242,10 @@ export function createPool({ ctx, config, store, logger = console }) {
           name: provider?.name ?? '',
           free: provider?.id ? isFreeProvider(provider.id, config) : false,
           freeSource: provider?.id ? freeClassOf(provider.id, config) : null,
+          // 限时免费额度的到期日：用户要能提前看到"这条免费通道还能用到哪天"，
+          // 而不是等它到期后悄悄转成付费调用。
+          freeExpiresAt: provider?.id ? freeChannelInfo(provider.id, config).expiresAt : null,
+          freeExpired: provider?.id ? freeChannelInfo(provider.id, config).expired : false,
           error: provider?.id ? (providerErrors.get(provider.id) ?? null) : null,
           // 原始元数据里的标量字段：判断“这个 provider 属于哪个插件”要靠它
           // （settingsNs / plugin / adapter 之类），不落盘就无从诊断。

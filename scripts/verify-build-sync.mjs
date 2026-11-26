@@ -56,7 +56,11 @@ const FEATURE_MARKS = [
   { file: 'pool/provider-id.js', mark: 'matchesProviderList', why: 'provider family 归一化（modlens 变体不漏网）' },
   { file: 'pool/provider-id.js', mark: 'familyIndex', why: 'providerOrder 置顶按 family 匹配' },
   { file: 'config.js', mark: 'impliedProviders', why: '按量计费 provider 永不判免费（defaultFree 也拦）' },
-  { file: 'failover/failover.js', mark: 'allowPaidNow', why: '付费兜底受 allowPaid 约束' }
+  { file: 'failover/failover.js', mark: 'allowPaidNow', why: '付费兜底受 allowPaid 约束' },
+  { file: 'pool/free-channels.js', mark: 'DEFAULT_CHANNEL_EXPIRY', why: '限时免费额度到期日' },
+  { file: 'pool/free-channels.js', mark: 'freeChannelStatus', why: '通道免费三态（含到期）' },
+  { file: 'config.js', mark: 'channelExpiry', why: '到期表归一化 + freeClassOf 到期降级' },
+  { file: 'pool/pool.js', mark: 'freeExpiresAt', why: '状态落盘带到期日' }
 ]
 
 const failures = []

@@ -34,14 +34,14 @@ test('用户自行注册、领厂商免费配额的通道按免费处理', () =>
   const config = normalizeConfig({})
   // 这些通道走的是厂商白送的新人/每日额度（凭据库里已有 Key），
   // 不算订阅付费，必须按免费算，否则会被排到免费模型之后、探针也探不到。
-  for (const id of ['agnes', 'siliconflow', 'bailian', 'zhipu']) {
+  for (const id of ['agnes', 'siliconflow', 'bailian', 'zhipu', 'sensenova', 'spark']) {
     assert.equal(isFreeProvider(id, config), true, `${id} 应算免费通道`)
   }
 })
 
 test('真正的订阅付费通道仍按付费处理', () => {
   const config = normalizeConfig({})
-  for (const id of ['spark', 'minimax-cn', 'deepseek-official', 'workbuddy', 'workbuddy-ai']) {
+  for (const id of ['minimax-cn', 'deepseek-official', 'workbuddy', 'workbuddy-ai', 'qoder-fake-saas']) {
     assert.equal(isFreeProvider(id, config), false, `${id} 不应被判免费`)
   }
 })

@@ -8,7 +8,11 @@
  *
  * @module config
  */
-import { DEFAULT_FREE_CHANNELS, matchesFreeChannel } from './pool/free-channels.js'
+import {
+  DEFAULT_CHANNEL_EXPIRY,
+  DEFAULT_FREE_CHANNELS,
+  freeChannelStatus
+} from './pool/free-channels.js'
 import { lookupByFamily, matchesProviderList, providerFamily } from './pool/provider-id.js'
 
 /**
@@ -70,6 +74,11 @@ export const DEFAULT_CONFIG = Object.freeze({
     channels: Object.freeze([...DEFAULT_FREE_CHANNELS]),
     /** provider id 命中这些片段即视为免费通道（兜底规则）。 */
     patterns: Object.freeze(['free']),
+    /**
+     * 限时免费额度的到期日（`YYYY-MM-DD`，含当天有效）。
+     * 到期后该通道按付费处理 —— 促销额度变成按量计费以后，还当免费用就是烧钱。
+     */
+    channelExpiry: Object.freeze({ ...DEFAULT_CHANNEL_EXPIRY }),
     /** 免费条目的基础优先级加成，保证同成本排序靠前。 */
     priorityBonus: 1_000,
     /**
@@ -343,6 +352,43 @@ function priorities(value) {
 }
 
 /**
+ * 归一化「限时免费到期日」表：内置默认值打底，用户可覆盖（按 family 认 key，
+ * `modlens-agnes` 与 `agnes` 视为同一通道）。
+ *
+ * 值允许三种：
+ *  - `'YYYY-MM-DD'` 到期日（含当天有效）
+ *  - `null`         显式"不设期限"（覆盖内置的到期日，用于额度变成长期有效的场景）
+ *  - 其他/非法      忽略，保留内置值（不因为一个手滑的日期把免费额度全判死）
+ *
+ * @param {unknown} value
+ * @returns {Record<string, string|null>}
+ */
+function expiryMap(value) {
+  /** @type {Record<string, string|null>} */
+  const out = { ...DEFAULT_CHANNEL_EXPIRY }
+  if (typeof value !== 'object' || value === null) return out
+  for (const [key, raw] of Object.entries(value)) {
+    const family = providerFamily(key)
+    if (family === '') continue
+    if (raw === null) {
+      // 先按 family 清掉内置同族条目，再登记 null（表示无期限）。
+      for (const existing of Object.keys(out)) {
+        if (providerFamily(existing) === family) delete out[existing]
+      }
+      out[family] = null
+      continue
+    }
+    if (typeof raw !== 'string') continue
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw.trim())) continue
+    for (const existing of Object.keys(out)) {
+      if (providerFamily(existing) === family) delete out[existing]
+    }
+    out[family] = raw.trim()
+  }
+  return out
+}
+
+/**
  * 归一化终极兜底通道。`false` / `null` = 关闭。
  * @param {unknown} value
  * @returns {{ provider: string, model: string | null } | null}
@@ -396,6 +442,7 @@ export function normalizeConfig(raw) {
       providers: strings(free.providers),
       channels: Array.isArray(free.channels) ? strings(free.channels) : [...DEFAULT_FREE_CHANNELS],
       patterns: strings(free.patterns).length > 0 ? strings(free.patterns) : [...DEFAULT_CONFIG.free.patterns],
+      channelExpiry: expiryMap(free.channelExpiry),
       priorityBonus: num(free.priorityBonus, 0, 100_000, DEFAULT_CONFIG.free.priorityBonus),
       defaultFree: free.defaultFree === true
     },
@@ -544,11 +591,33 @@ export function normalizeConfig(raw) {
  * @param {ReturnType<typeof normalizeConfig>} config
  * @returns {'config' | 'channel' | 'pattern' | 'default' | null} 命中来源，null = 付费
  */
+/**
+ * 通道免费状态（含到期信息），供状态接口与诊断面板展示：
+ * 「这条免费通道还能用到哪天」是用户唯一能提前止损的线索。
+ *
+ * @param {string} provider
+ * @param {ReturnType<typeof normalizeConfig>} config
+ * @returns {{ channel: boolean, expired: boolean, expiresAt: string | null }}
+ */
+export function freeChannelInfo(provider, config) {
+  return freeChannelStatus(provider, {
+    channels: config.free.channels,
+    channelExpiry: config.free.channelExpiry
+  })
+}
+
 export function freeClassOf(provider, config) {
   if (matchesProviderList(provider, config.paid.providers)) return null
   if (matchesProviderList(provider, config.free.providers)) return 'config'
   if (matchesProviderList(provider, config.paid.impliedProviders)) return null
-  if (matchesFreeChannel(provider, config.free.channels)) return 'channel'
+  const channel = freeChannelStatus(provider, {
+    channels: config.free.channels,
+    channelExpiry: config.free.channelExpiry
+  })
+  if (channel.channel && !channel.expired) return 'channel'
+  // 名单内的限时通道已经到期：这是**付费**通道，而且必须在这里直接收尾 ——
+  // 让它继续往下走会被 free.defaultFree 捞回免费队列，等于促销结束后接着烧钱。
+  if (channel.channel) return null
   const lowered = providerFamily(provider)
   if (config.free.patterns.some((pattern) => lowered.includes(pattern.trim().toLowerCase()))) return 'pattern'
   // 白名单模式：paid.providers 就是全部付费通道，其余一律免费。
