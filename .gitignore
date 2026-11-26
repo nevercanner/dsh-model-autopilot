@@ -3,3 +3,6 @@ node_modules/
 *.bak
 .dsh-bus/
 .dsh-bus.json
+
+# 手工备份文件不进仓库
+*.bak-*
