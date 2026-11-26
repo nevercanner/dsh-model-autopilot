@@ -41,6 +41,10 @@ export function scoreEntry(entry, context) {
   // 额度情报：现在有免费额度的通道优先消耗；额度已截止的降权。
   score += quotaScore(entry, quota)
 
+  // 免费 flash 通道优先（用户口径：免费的里优先 deepseek v4 flash，
+  // 但保底付费通道 deepseek-account 要在最后才用）。
+  score += preferFlashScore(entry, config)
+
   // 输出被 max_tokens 截断过：说明这个通道的输出预算不够用。
   // 不判失败（模型没坏），但让位给能写完整回答的模型。
   const truncated = entry.truncatedCount ?? 0
@@ -89,6 +93,37 @@ export function quotaScore(entry, quota) {
   if (info.hasUsableQuota) return 30
   if (info.expired) return -30
   return 0
+}
+
+/**
+ * 是不是「优先用的免费 flash 通道」。
+ *
+ * 用户口径：「免费的也优先用 deepseek v4 flash 的，然后除了 deepseek-account 的，
+ * 其他的都在这个范围内」——
+ *   - 必须 `cost === 'free'`（不花钱）
+ *   - provider 不能是 `deepseek-account`（那是保底付费通道，要留在最后）
+ *   - 模型名命中 deepseek + v4 + flash
+ *
+ * 为什么要单独一档而不是只调 priority：priority 只影响组内相对顺序，
+ * 而这里要的是「免费组里，这批排在其它免费通道之前」—— 用加成实现，
+ * 既不动 probe 的优先级配置，也不影响付费组。
+ *
+ * @param {import('../pool/types.js').ModelEntry} entry
+ * @param {{ schedule?: { preferFlash?: { enabled?: boolean, providers?: readonly string[], bonus?: number } } }} config
+ * @returns {number} 命中时返回加成值，否则 0
+ */
+export function preferFlashScore(entry, config) {
+  const rule = config?.schedule?.preferFlash
+  if (!rule || rule.enabled === false) return 0
+  // 保底通道不参与优先：它要在最后才用。
+  const blocked = rule.providers ?? []
+  if (blocked.includes(entry.provider)) return 0
+  if (entry.cost !== 'free') return 0
+  const name = `${entry.model ?? ''}`.toLowerCase()
+  if (!name.includes('deepseek')) return 0
+  if (!/v?4(\.\d+)?/.test(name)) return 0
+  if (!name.includes('flash')) return 0
+  return typeof rule.bonus === 'number' ? rule.bonus : 0
 }
 
 /**

@@ -93,6 +93,24 @@ export const DEFAULT_CONFIG = Object.freeze({
      * 扣 468 分，稳定排到后面去（1~2s 的快通道只扣 12~24 分，不受影响）。
      */
     latencyPenaltyPerSecond: 12,
+    /**
+     * 免费 flash 通道优先。
+     *
+     * 用户口径：「免费的也优先用 deepseek v4 flash 的，然后除了 deepseek-account
+     * 的，其他的都在这个范围内」——
+     *   - 只在**免费组内**生效（付费通道不受影响）；
+     *   - `deepseek-account` 被排除（它是保底付费通道，要留到最后）；
+     *   - 命中的条目在免费组里排到其它免费通道之前。
+     *
+     * 加成取 300：足够越过「同组内其它免费通道」的分差（延迟惩罚最多几百），
+     * 又远小于免费/付费之间的 1000 分差 —— 不会把付费通道挤到免费前面。
+     */
+    preferFlash: Object.freeze({
+      enabled: true,
+      /** 排除的 provider：保底通道不参与优先。 */
+      providers: Object.freeze(['deepseek-account']),
+      bonus: 300
+    }),
     /** 冷却已到期、等待复检的条目的加分（给恢复中的通道一次机会）。 */
     halfOpenBonus: 10,
     /**
@@ -349,6 +367,17 @@ export function normalizeConfig(raw) {
         1_000,
         DEFAULT_CONFIG.schedule.latencyPenaltyPerSecond
       ),
+      preferFlash: (() => {
+        const rule =
+          typeof schedule.preferFlash === 'object' && schedule.preferFlash !== null ? schedule.preferFlash : {}
+        return {
+          enabled: rule.enabled !== false,
+          providers: Array.isArray(rule.providers)
+            ? strings(rule.providers)
+            : [...DEFAULT_CONFIG.schedule.preferFlash.providers],
+          bonus: num(rule.bonus, 0, 100_000, DEFAULT_CONFIG.schedule.preferFlash.bonus)
+        }
+      })(),
       halfOpenBonus: num(schedule.halfOpenBonus, 0, 100_000, DEFAULT_CONFIG.schedule.halfOpenBonus),
       hostRetry: schedule.hostRetry === true
     },

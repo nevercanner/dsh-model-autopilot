@@ -303,7 +303,11 @@ export function createAutopilotAdapter({ getAutopilot, config, logger = console 
             ? `\n[已重试 ${round} 轮 / ${elapsedSec}s 仍未成功：${truncate(message, 140)}。` +
               `继续重试 —— 你可以随时点停止。]\n`
             : `\n[第 ${round} 轮未成功：${truncate(message, 100)}；${waitSec}s 后自动重试…]\n`
-          yield { type: 'reasoning-delta', text: notice }
+          // index 必填：宿主对 text-delta / reasoning-delta 都要求
+          // `index` 是非负安全整数（dsh-llm safeIndex，「index must be
+          // a non-negative safe integer」）。缺它整条流会被判非法。
+          // 用 0：进度是一个独立的 reasoning 块，不跟模型的 reasoning 抢编号。
+          yield { type: 'reasoning-delta', index: 0, text: notice }
 
           // 轮间等待：让冷却中的通道恢复（throttled 是瞬时的，等一会儿能好）。
           await sleepAbortable(roundDelayMs, /** @type {any} */ (options)?.signal)

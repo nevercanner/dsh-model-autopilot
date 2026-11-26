@@ -462,18 +462,35 @@ function pickTerminalFallback(pool, config, excluded) {
  * @param {AsyncIterator<any>} iterator
  * @param {any[]} firstChunks
  */
+const INDEXED_DELTA_TYPES = new Set(['text-delta', 'reasoning-delta', 'tool-call-delta'])
+
+/**
+ * 宿主 BlockAssembler 对 delta chunk 调 safeIndex(chunk.index, label)，
+ * 非「非负安全整数」直接抛 `xxx index must be a non-negative safe integer`。
+ * 部分 reasoning 模型（如 openference deepSeek-V4.1-Flash）上游流漏带 index
+ * 或吐出 null/-1/字符串，failover 纯转发会把非法值送进宿主导致整轮崩溃。
+ * 转发前兜底：delta 类 chunk 的 index 非法 → 补 0（单 block 场景合法）。
+ */
+function normalizeChunkIndex(chunk) {
+  if (!chunk || typeof chunk !== 'object') return chunk
+  if (!INDEXED_DELTA_TYPES.has(chunk.type)) return chunk
+  const idx = chunk.index
+  if (Number.isSafeInteger(idx) && idx >= 0 && !Object.is(idx, -0)) return chunk
+  return { ...chunk, index: 0 }
+}
+
 function trackStream(pool, entry, iterator, firstChunks) {
   return (async function* replay() {
     try {
       for (const chunk of firstChunks) {
         recordTruncation(pool, entry, chunk)
-        yield chunk
+        yield normalizeChunkIndex(chunk)
       }
       while (true) {
         const next = await iterator.next()
         if (next.done) return
         recordTruncation(pool, entry, next.value)
-        yield next.value
+        yield normalizeChunkIndex(next.value)
       }
     } catch (error) {
       const verdict = classifyError(error)
