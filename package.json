@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-model-autopilot",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "DSH 层自动选模型：免费优先 + 探针 + 故障切换（当前阶段：模型池 + 探针）",
   "private": true,
   "type": "module",
