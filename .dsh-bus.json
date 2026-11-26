@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "transport": {
+    "kind": "sqlite"
+  },
+  "scope": "project"
+}
