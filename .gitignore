@@ -1,2 +1,5 @@
 node_modules/
 *.tgz
+*.bak
+.dsh-bus/
+.dsh-bus.json
