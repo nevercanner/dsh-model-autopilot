@@ -412,8 +412,11 @@ async function raceCandidates(ctx, pool, contenders, call, timeoutMs) {
  * 挑一个终极兜底模型：`config.failover.terminalFallback` 指定的通道里，
  * 挑一个没被排除、没判死、且不在冷却中的条目。
  *
- * 兜底**不受 `allowPaid` 限制** —— 它本身就是「付费也能用」的那一层，
- * 否则免费全挂时还是会停住。
+ * 兜底要过两道闸：
+ * 1. `allowPaid` —— 调用方显式允许付费（或配置 `schedule.allowPaidByDefault` 为真）
+ *    时才用；免费优先模式下一律不碰付费通道，否则「不烧钱」的配置等于摆设。
+ * 2. `schedule.excludeProviders` —— 按 family 匹配（`modlens-deepseek-account`
+ *    与 `deepseek-account` 同族），名单里排掉的通道不许从这里复活。
  *
  * @param {any} pool
  * @param {any} config
@@ -430,7 +433,8 @@ function pickTerminalFallback(pool, config, excluded) {
   const excludedSet = new Set(excluded)
   const sameProvider = pool
     .all()
-    .filter((entry) => entry.provider === target.provider)
+    // 按 family 认：兜底写 `deepseek-account`，池里可能只有 `modlens-deepseek-account`。
+    .filter((entry) => sameFamily(entry.provider, target.provider))
     .filter((entry) => (target.model === null ? true : entry.model === target.model))
 
   // 第一优先：本次请求没试过、健康、不在冷却里的。
