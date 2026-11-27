@@ -327,3 +327,54 @@ test('explain 与 plan 口径一致：锁定项在两边都是第一', () => {
   assert.equal(rows[0].pinned, true)
   assert.equal(rows[1].key, 'our-free-model/free', '让位顺序是免费优先')
 })
+
+// ── 锁定 vs allowPaid=false（用户限时额度窗口不白烧）──────────────────────
+
+test('allowPaid=false 时锁定的付费通道仍然被选中（充值通道先用）', () => {
+  // 病灶：allowPaid 的闸门跑在锁定匹配之前 → 付费锁定项在候选集里根本看不见，
+  // 面板显示锁定通道、实际生成走免费通道，5 小时额度的积分白烧。
+  const scheduler = makeSchedulerWithPreference(
+    [
+      entry({ key: 'our-free-model/free', provider: 'our-free-model', cost: 'free', priority: 9_999 }),
+      entry({ key: 'minimax-cn/MiniMax-M3', model: 'MiniMax-M3', provider: 'minimax-cn', cost: 'paid' }),
+      entry({ key: 'magpie/paid-x', provider: 'magpie', cost: 'paid' })
+    ],
+    'minimax-cn'
+  )
+  const plan = scheduler.plan({ now: 1_000, allowPaid: false })
+  assert.equal(plan.primary.key, 'minimax-cn/MiniMax-M3', '锁定的付费通道必须压过 allowPaid=false')
+  assert.equal(plan.reason, 'pinned:minimax-cn')
+  // 未锁定的付费项仍然被挡住 —— 放行只对锁定通道生效
+  assert.ok(
+    plan.rejected.some((item) => item.key === 'magpie/paid-x' && item.reason === 'allowPaid=false'),
+    '未锁定的付费通道仍要被 allowPaid=false 挡住'
+  )
+})
+
+test('锁定的模型不可用时退到同通道的兄弟模型，而不是跳回免费通道', () => {
+  const scheduler = makeSchedulerWithPreference(
+    [
+      entry({ key: 'our-free-model/free', provider: 'our-free-model', cost: 'free', priority: 9_999 }),
+      entry({ key: 'minimax-cn/MiniMax-M3', model: 'MiniMax-M3', provider: 'minimax-cn', cost: 'paid', health: 'dead' }),
+      entry({ key: 'minimax-cn/MiniMax-M2.7', model: 'MiniMax-M2.7', provider: 'minimax-cn', cost: 'paid' })
+    ],
+    'minimax-cn',
+    'MiniMax-M3'
+  )
+  const plan = scheduler.plan({ now: 1_000, allowPaid: false })
+  assert.equal(plan.primary.key, 'minimax-cn/MiniMax-M2.7', '同通道的兄弟模型应当顶上')
+  assert.equal(plan.reason, 'pinned:minimax-cn:MiniMax-M2.7')
+})
+
+test('全池冷却时锁定通道排最前（额度窗口不等人）', () => {
+  const scheduler = makeSchedulerWithPreference(
+    [
+      entry({ key: 'free/a', provider: 'free-p', cost: 'free', cooldownUntil: 9_000 }),
+      entry({ key: 'minimax-cn/MiniMax-M3', model: 'MiniMax-M3', provider: 'minimax-cn', cost: 'paid', cooldownUntil: 90_000 })
+    ],
+    'minimax-cn'
+  )
+  const plan = scheduler.plan({ now: 1_000, allowPaid: false })
+  assert.equal(plan.primary.key, 'minimax-cn/MiniMax-M3', '锁定通道要抢在冷却时间更长的免费通道前面')
+  assert.equal(plan.reason, 'pinned:cooling-last-resort')
+})

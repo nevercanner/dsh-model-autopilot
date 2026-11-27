@@ -245,6 +245,18 @@ export const DEFAULT_CONFIG = Object.freeze({
     /** false = 首帧前失败立刻换模型，不在同一模型上重试。 */
     retrySameModel: true,
     /**
+     * 同一通道连续多少次「传输类失败」后，跳过该通道剩余模型。
+     *
+     * 传输类失败（连接被拒 / DNS 失败 / 502 / 上游超时）几乎都是**整条上游路**
+     * 挂掉，而不是某个模型名坏了。同 provider 的兄弟模型指向同一个上游，接着试
+     * 只是把尝试次数耗在同一个死上游上 —— 实测一次请求 33 次尝试里有一大半是
+     * 同几个通道的重复重撞，白白拖满预算。
+     *
+     * 设为 0 关闭这个跳过。锁定通道（用户显式指定的付费通道）不受影响：
+     * 那条通道的额度可能限时过期，多试一次就是多赚一点。
+     */
+    providerTransportFailures: 2,
+    /**
      * 等「首个语义帧」的上限。必须存在：provider 可能接受请求却一直不吐数据
      * （上游卡死、连接半开、网关排队），没有这个上限，整条会话会无限挂起
      * —— 表现就是「卡了」，而且宿主的 stream idle 超时管不到首帧之前这段。
@@ -546,6 +558,12 @@ export function normalizeConfig(raw) {
       terminalFallback: normalizeTerminalFallback(failover.terminalFallback),
       maxRetriesPerModel: num(failover.maxRetriesPerModel, 0, 10, DEFAULT_CONFIG.failover.maxRetriesPerModel),
       retrySameModel: failover.retrySameModel !== false,
+      providerTransportFailures: num(
+        failover.providerTransportFailures,
+        0,
+        10,
+        DEFAULT_CONFIG.failover.providerTransportFailures
+      ),
       firstFrameTimeoutMs: num(
         failover.firstFrameTimeoutMs,
         1_000,

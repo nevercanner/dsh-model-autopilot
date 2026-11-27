@@ -1061,3 +1061,94 @@ test('宿主链路：传给下游的请求不残留 autopilot/auto 虚拟路由'
   assert.equal(seen[0].provider, 'our-free-model')
   assert.equal(seen[0].model, 'free-a')
 })
+
+// ── 传输类失败：整条上游路挂掉 vs 某个模型名坏了 ─────────────────────────
+
+/** @param {Record<string, any>} [extra] */
+function transportFailoverConfig(extra = {}) {
+  return {
+    failover: {
+      maxModels: 10,
+      maxRetriesPerModel: 0,
+      retrySameModel: false,
+      backoff: { initialMs: 0, maxMs: 0, jitterRatio: 0 },
+      gatewayProviders: [],
+      ...extra
+    }
+  }
+}
+
+test('同通道连续两个模型传输类失败后，跳过该通道剩余模型', async () => {
+  // 病灶：同 provider 的兄弟模型指向同一条上游，上游挂了还接着试，
+  // 一次请求 33 次尝试里有一大半是同一个死上游的重撞。
+  const { failover, llm } = await setup({
+    models: { 'aaa-broken': ['b1', 'b2', 'b3'], 'zzz-good': ['g1'] },
+    behaviour: {
+      'aaa-broken/b1': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b2': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b3': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } }
+    },
+    config: transportFailoverConfig()
+  })
+
+  const result = await failover.run({ messages: [] })
+  assert.equal(result.model.key, 'zzz-good/g1')
+  assert.ok(llm.calls.includes('aaa-broken/b1'))
+  assert.ok(llm.calls.includes('aaa-broken/b2'))
+  assert.ok(!llm.calls.includes('aaa-broken/b3'), 'b3 应被跳过（同一条上游已连续挂两个模型）')
+})
+
+test('传输类跳过阈值可配置（0 = 关闭该行为）', async () => {
+  const { failover, llm } = await setup({
+    models: { 'aaa-broken': ['b1', 'b2', 'b3'], 'zzz-good': ['g1'] },
+    behaviour: {
+      'aaa-broken/b1': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b2': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b3': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } }
+    },
+    config: transportFailoverConfig({ providerTransportFailures: 0 })
+  })
+
+  await failover.run({ messages: [] })
+  assert.ok(llm.calls.includes('aaa-broken/b3'), '阈值为 0 时不应跳过任何模型')
+})
+
+test('锁定的通道即使传输类失败也不跳过它的兄弟模型（限时额度不白烧）', async () => {
+  const { failover, llm } = await setup({
+    models: { 'aaa-broken': ['b1', 'b2', 'b3'], 'zzz-good': ['g1'] },
+    behaviour: {
+      'aaa-broken/b1': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b2': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b3': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } }
+    },
+    preference: { isPinned: () => true, get: () => ({ provider: 'aaa-broken', model: null }) },
+    config: transportFailoverConfig()
+  })
+
+  const result = await failover.run({ messages: [] })
+  assert.ok(llm.calls.includes('aaa-broken/b3'), '锁定通道的兄弟模型不应被跳过')
+  assert.equal(result.model.key, 'zzz-good/g1')
+})
+
+test('候选全挂时报错带失败原因分布（能回答「为什么全失败」）', async () => {
+  const { failover } = await setup({
+    models: { 'aaa-broken': ['b1', 'b2'], 'bbb-broken': ['c1', 'c2'] },
+    behaviour: {
+      'aaa-broken/b1': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'aaa-broken/b2': { throw: { code: 'TRANSPORT', message: 'connect ECONNREFUSED' } },
+      'bbb-broken/c1': { throw: { code: 'TRANSPORT', message: 'fetch failed' } },
+      'bbb-broken/c2': { throw: { code: 'TRANSPORT', message: 'fetch failed' } }
+    },
+    config: transportFailoverConfig()
+  })
+
+  await assert.rejects(
+    () => failover.run({ messages: [] }),
+    (err) => {
+      assert.match(err.message, /所有候选模型均失败/)
+      assert.match(err.message, /失败原因 unavailable×4/, '失败原因分布要写进报错文本')
+      assert.equal(err.failures.unavailable, 4, '失败原因分布要能机器读取')
+      return true
+    }
+  )
+})
