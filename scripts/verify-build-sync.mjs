@@ -60,7 +60,12 @@ const FEATURE_MARKS = [
   { file: 'pool/free-channels.js', mark: 'DEFAULT_CHANNEL_EXPIRY', why: '限时免费额度到期日' },
   { file: 'pool/free-channels.js', mark: 'freeChannelStatus', why: '通道免费三态（含到期）' },
   { file: 'config.js', mark: 'channelExpiry', why: '到期表归一化 + freeClassOf 到期降级' },
-  { file: 'pool/pool.js', mark: 'freeExpiresAt', why: '状态落盘带到期日' }
+  { file: 'pool/pool.js', mark: 'freeExpiresAt', why: '状态落盘带到期日' },
+  { file: 'schedule/scheduler.js', mark: 'cooling-last-resort', why: '全池冷却时捞回最早解冻条目，不再 0 次尝试' },
+  { file: 'config.js', mark: 'coolingFallback', why: '全池冷却兜底开关' },
+  { file: 'pool/transitions.js', mark: 'quotaCooldown', why: '额度耗尽独立长冷却（不按限流指数重试）' },
+  { file: 'probe/classify.js', mark: 'VERDICT.quota', why: '额度类失败单独成类' },
+  { file: 'schedule/scoring.js', mark: 'healthTier', why: '健康档优先于加分（可用不再被降级通道挤掉）' }
 ]
 
 const failures = []

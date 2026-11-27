@@ -60,14 +60,38 @@ test('免费全部冷却时才回落到付费，并留下可诊断的 reason', (
   assert.equal(plan.reason, 'free:none→paid')
 })
 
-test('allowPaid=false 时，免费全不可用就直接没有候选', () => {
+test('全池冷却时捞回最早解冻的免费条目试一次，而不是 0 次尝试直接失败', () => {
+  // 报障现场：28 个冷却中 + 5 个付费被 allowPaid 挡住 → 一轮请求一次都没打就失败。
   const scheduler = makeScheduler([
     entry({ key: 'free/a', cost: 'free', cooldownUntil: 9_000 }),
     entry({ key: 'paid/x', cost: 'paid' })
   ])
   const plan = scheduler.plan({ now: 1_000, allowPaid: false })
+  assert.equal(plan.primary.key, 'free/a')
+  assert.equal(plan.reason, 'free:cooling-last-resort')
+})
+
+test('coolingFallback=false 时恢复旧行为：没有候选就是没有候选', () => {
+  const scheduler = makeScheduler(
+    [
+      entry({ key: 'free/a', cost: 'free', cooldownUntil: 9_000 }),
+      entry({ key: 'paid/x', cost: 'paid' })
+    ],
+    { schedule: { coolingFallback: false } }
+  )
+  const plan = scheduler.plan({ now: 1_000, allowPaid: false })
   assert.equal(plan.primary, null)
   assert.equal(plan.reason, 'no-candidate:free-only')
+})
+
+test('冷却候选里有可用的付费条目不抢免费（免费优先仍然成立）', () => {
+  const scheduler = makeScheduler([
+    entry({ key: 'free/a', cost: 'free', cooldownUntil: 9_000 }),
+    entry({ key: 'paid/x', cost: 'paid', priority: 99 })
+  ])
+  const plan = scheduler.plan({ now: 1_000, allowPaid: true })
+  assert.equal(plan.primary.key, 'paid/x')
+  assert.equal(plan.reason, 'free:none→paid')
 })
 
 test('dead 与冷却中的条目被排除，并给出原因', () => {

@@ -37,6 +37,15 @@ export const VERDICT = Object.freeze({
   retired: 'retired',
   unavailable: 'unavailable',
   timeout: 'timeout',
+  /**
+   * 额度耗尽（余额不足 / 无可用资源包 / 402 / 欠费）。
+   *
+   * 为什么不复用 throttled：两者的恢复时间差了两个数量级。限流是「等几秒到几分钟」，
+   * 余额不足是「等用户充值」，把它按 60s→30min 的指数冷却反复重试，只会让每一轮
+   * 都先白打几次必定 402 的请求，把 failCount 顶到 190+，还顺手把整个池子的冷却占满
+   * （报障现场：28 个冷却中、0 次尝试、直接失败）。额度类失败进独立的长冷却。
+   */
+  quota: 'quota',
   /** 流正常结束但没有产出任何 token —— 通道通但模型退化。 */
   empty: 'empty',
   /**

@@ -38,6 +38,21 @@ export function cooldownFor(failCount, cfg) {
 }
 
 /**
+ * 额度类失败的冷却：余额不足不是「等几分钟」，是「等充值」。
+ *
+ * 用独立的 `cooldown.quotaMs`（默认 6 小时）而不是指数冷却的 maxMs，是因为两者
+ * 语义不同：指数冷却衡量「抖动程度」，额度冷却衡量「钱没了要人去处理」。
+ * 复用它会把一个必然 402 的通道每 30 分钟捞出来重试一次，failCount 顶到几百，
+ * 顺便把别的条目的冷却水位一起抬高。
+ * @param {{ maxMs: number, quotaMs?: number }} cfg
+ * @returns {number}
+ */
+export function quotaCooldown(cfg) {
+  const value = typeof cfg.quotaMs === 'number' && cfg.quotaMs > 0 ? cfg.quotaMs : 6 * 60 * 60_000
+  return Math.max(cfg.maxMs, value)
+}
+
+/**
  * 一次判决要写回的补丁。
  *
  * 规则表：
@@ -102,7 +117,8 @@ export function transition(entry, verdict, meta, config) {
 
   const structural = STRUCTURAL_VERDICTS.has(verdict)
   const failCount = entry.failCount + 1
-  const cooldown = cooldownFor(failCount, config.cooldown)
+  // 额度耗尽走独立的长冷却：见 quotaCooldown 的注释。
+  const cooldown = verdict === VERDICT.quota ? quotaCooldown(config.cooldown) : cooldownFor(failCount, config.cooldown)
 
   // 瞬时判决永不靠次数判死；只有结构性判决才立即 dead。
   /** @type {import('./types.js').EntryHealth} */
@@ -168,7 +184,7 @@ export function transitionFailure(entry, verdict, at, config) {
     }
   }
   const failCount = entry.failCount + 1
-  const cooldown = cooldownFor(failCount, config.cooldown)
+  const cooldown = verdict === VERDICT.quota ? quotaCooldown(config.cooldown) : cooldownFor(failCount, config.cooldown)
   const health = structural ? HEALTH.dead : HEALTH.cooling
   const hide = structural || cooldown >= config.cooldown.hideAfterMs
   return {

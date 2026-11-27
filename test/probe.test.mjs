@@ -126,8 +126,23 @@ test('classify：地区文案与状态码兜底', () => {
     classifyFailure({ code: 'UNKNOWN', message: 'gemini: 模型 gemini-3.8-flash 的所有账号均不可用（限流或额度耗尽），请稍后再试' }),
     VERDICT.throttled
   )
-  assert.equal(classifyFailure({ code: 'UNKNOWN', message: '免费额度已用完，请升级套餐' }), VERDICT.throttled)
-  assert.equal(classifyFailure({ code: 'UNKNOWN', message: '积分不足' }), VERDICT.throttled)
+  // 额度类：等充值，不是等几分钟 —— 必须和限流分开，否则每轮都会白打 402。
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: '免费额度已用完，请升级套餐' }), VERDICT.quota)
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: '积分不足' }), VERDICT.quota)
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: '余额不足' }), VERDICT.quota)
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: 'HTTP 402 Payment Required' }), VERDICT.quota)
+  assert.equal(
+    classifyFailure({ code: 'UNKNOWN', message: '429 {"code":"1113","message":"余额不足或无可用资源包,请充值。"}' }),
+    VERDICT.quota
+  )
+  assert.equal(
+    classifyFailure({ code: 'UNKNOWN', message: '402 {"code":30001,"message":"Sorry, your account balance is insufficient"}' }),
+    VERDICT.quota
+  )
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: 'insufficient balance' }), VERDICT.quota)
+  // 纯限流仍然是 throttled（可等）
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: '429 rate limit exceeded, retry later' }), VERDICT.throttled)
+  assert.equal(classifyFailure({ code: 'UNKNOWN', message: 'inference exceeds tpm/rpm limit' }), VERDICT.throttled)
   // 中文文案：登录/凭据
   assert.equal(classifyFailure({ code: 'UNKNOWN', message: '请先登录后再试' }), VERDICT.auth)
   assert.equal(classifyFailure({ code: 'UNKNOWN', message: '没有可用凭据' }), VERDICT.auth)

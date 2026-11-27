@@ -62,6 +62,14 @@ export const DEFAULT_CONFIG = Object.freeze({
     baseMs: 60_000,
     /** 冷却上限。 */
     maxMs: 30 * 60_000,
+    /**
+     * 额度耗尽（余额不足/欠费/402）的冷却时长。
+     *
+     * 独立于指数冷却：那边衡量「抖动」，这边衡量「钱没了，要人去充值」。
+     * 默认 6 小时 —— 让必然失败的通道安静下来，同时保持每天复检两次，
+     * 用户充值后最多半天就能自动恢复。
+     */
+    quotaMs: 6 * 60 * 60_000,
     /** 连续失败多少次判定为 dead（鉴权/地区类失败一次即 dead）。 */
     deadFailCount: 3,
     /** 冷却超过这个时长才从模型选择界面屏蔽（短期抖动不隐藏）。 */
@@ -105,6 +113,14 @@ export const DEFAULT_CONFIG = Object.freeze({
   schedule: Object.freeze({
     /** 全局开关：false = 永不全落到付费（免费全挂时直接报错）。 */
     allowPaidByDefault: true,
+    /**
+     * 全池冷却时，把「最早解冻」的那条捞回来试一次，而不是 0 次尝试直接失败。
+     *
+     * 报障现场：28 个条目全在冷却、付费被 allowPaid 挡住 → plan() 返回空 →
+     * 一轮请求一次都没打就失败，宿主 20 秒后重试还是同样结果。
+     * 冷却是对**过去**失败的预测，不等于此刻一定不通；宁可多记一次 failCount。
+     */
+    coolingFallback: true,
     /**
      * 永远不进入模型池的 provider。
      * 默认排除本插件自己注册的虚拟 provider（'autopilot'）—— 它必须出现在
@@ -435,6 +451,7 @@ export function normalizeConfig(raw) {
     cooldown: {
       baseMs: num(cooldown.baseMs, 1_000, 60 * 60_000, DEFAULT_CONFIG.cooldown.baseMs),
       maxMs: num(cooldown.maxMs, 1_000, 24 * 60 * 60_000, DEFAULT_CONFIG.cooldown.maxMs),
+      quotaMs: num(cooldown.quotaMs, 60_000, 24 * 60 * 60_000, DEFAULT_CONFIG.cooldown.quotaMs),
       deadFailCount: num(cooldown.deadFailCount, 1, 100, DEFAULT_CONFIG.cooldown.deadFailCount),
       hideAfterMs: num(cooldown.hideAfterMs, 0, 24 * 60 * 60_000, DEFAULT_CONFIG.cooldown.hideAfterMs)
     },
@@ -456,6 +473,7 @@ export function normalizeConfig(raw) {
     },
     schedule: {
       allowPaidByDefault: schedule.allowPaidByDefault !== false,
+      coolingFallback: schedule.coolingFallback !== false,
       excludeProviders:
         strings(schedule.excludeProviders).length > 0
           ? strings(schedule.excludeProviders)

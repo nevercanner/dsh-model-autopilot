@@ -168,9 +168,40 @@ export function compareEntries(a, b, context) {
   const rankB = providerRank(b.provider, context.config)
   if (rankA !== rankB) return rankA - rankB
 
+  // 探针已经验证过的健康档，压过一切加分。
+  //
+  // 报障现场：/plan 把 `siliconflow/...V4.1-Flash`（探针判定 degraded，上游原文
+  // 402 余额不足）排在 `agnes/agnes-3.0-flash`（available）前面，因为 v4 flash 的
+  // +500 加分盖过了健康度差异。结果每一轮都先白白打 4-6 次必定失败的请求，
+  // failCount 一路涨到 190+，还把池子的冷却全部占满。
+  // 所以：先比健康档，同档内再比分数。
+  const tierA = healthTier(a)
+  const tierB = healthTier(b)
+  if (tierA !== tierB) return tierA - tierB
+
   const delta = scoreEntry(b, context) - scoreEntry(a, context)
   if (delta !== 0) return delta
   if (a.cost !== b.cost) return a.cost === 'free' ? -1 : 1
   if (a.failCount !== b.failCount) return a.failCount - b.failCount
   return a.key.localeCompare(b.key)
+}
+
+/**
+ * 健康档：越小越优先。顺序 = 「确定能用」→「不知道」→「有失败记录」→「冷却中」→「死了」。
+ * @param {import('../pool/types.js').ModelEntry} entry
+ * @returns {number}
+ */
+export function healthTier(entry) {
+  switch (entry.health) {
+    case 'available':
+      return 0
+    case 'unknown':
+      return 1
+    case 'degraded':
+      return 2
+    case 'cooling':
+      return 3
+    default:
+      return 4
+  }
 }

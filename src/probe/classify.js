@@ -69,6 +69,10 @@ const REGION_PATTERNS = [
 
 /** HTTP 状态码兜底（部分 adapter 只把状态塞进 message 或 code）。 */
 const STATUS_PATTERNS = [
+  // 402 Payment Required = 余额/额度问题，不是限流：恢复要靠充值，不是等几分钟。
+  { re: /\b402\b/, verdict: VERDICT.quota },
+  // 智谱/Z.ai 的额度错误码 1113（「余额不足或无可用资源包」）。
+  { re: /\b1113\b/, verdict: VERDICT.quota },
   { re: /\b429\b/, verdict: VERDICT.throttled },
   { re: /\b(?:401|403)\b/, verdict: VERDICT.auth },
   { re: /\b(?:408|504)\b/, verdict: VERDICT.timeout },
@@ -89,12 +93,15 @@ const CHINESE_PATTERNS = [
     re: /(?:限流|流控|请求过于频繁|过于频繁|频率限制|稍后再试|稍后重试)/,
     verdict: VERDICT.throttled
   },
+  // 「余额不足 / 额度用完 / 请充值」属于额度问题：等用户充值才恢复，按长冷却处理。
   {
     re: /(?:额度|配额|积分|余额|免费额度|余量)(?:已)?(?:用尽|用完|耗尽|不足|超限|不够)/,
-    verdict: VERDICT.throttled
+    verdict: VERDICT.quota
   },
+  { re: /(?:无可用资源包|资源包(?:已)?(?:用完|耗尽|过期))/, verdict: VERDICT.quota },
+  { re: /(?:请充值|欠费|续费)/, verdict: VERDICT.quota },
   { re: /(?:所有账号|所有渠道|全部账号)(?:均)?不可用/, verdict: VERDICT.throttled },
-  { re: /升级(?:套餐|计划|会员)/, verdict: VERDICT.throttled },
+  { re: /升级(?:套餐|计划|会员)/, verdict: VERDICT.quota },
   { re: /(?:超出|超过)(?:上下文|最大)?(?:长度|窗口|限制)/, verdict: VERDICT.unavailable },
   // 账号层面的永久失效：禁用/封禁/冻结 → auth（一次即死，不复检）
   {
@@ -127,7 +134,10 @@ function classifyByText(text) {
   for (const pattern of REGION_PATTERNS) if (pattern.test(text)) return VERDICT.regionBlocked
   for (const { re, verdict } of STATUS_PATTERNS) if (re.test(text)) return verdict
   if (/\b(?:rate[\s_-]?limit|too many requests|throttl)/i.test(text)) return VERDICT.throttled
-  if (/\b(?:quota|insufficient[\s_-]?(?:quota|balance|credits?))/i.test(text)) return VERDICT.throttled
+  // 免费通道常见的限流原文：「inference exceeds tpm/rpm limit」
+  if (/\b(?:tpm|rpm)\b/i.test(text) || /\bexceeds?\b.*\blimit\b/i.test(text)) return VERDICT.throttled
+  if (/\b(?:insufficient|exceeded|out\s+of)[\s_-]?(?:quota|balance|credits?|funds)\b/i.test(text)) return VERDICT.quota
+  if (/\b(?:quota|billing|payment\s+required|arrears)\b/i.test(text)) return VERDICT.quota
   if (/\b(?:invalid|missing|expired)[\s_-]?(?:api[\s_-]?key|credential)/i.test(text)) return VERDICT.auth
   // "Invalid bearer token" / "bad access token" 这类：凭据本身不能用，换模型才有意义。
   if (/\b(?:invalid|missing|expired|bad|revoked)\s+(?:bearer\s+|access\s+|api\s+|auth\s+)?token\b/i.test(text)) {
