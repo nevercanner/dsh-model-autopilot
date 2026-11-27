@@ -16,8 +16,17 @@
 import { VERDICT } from '../pool/types.js'
 import { failureOf } from '../util.js'
 
-/** 限流/配额：等一会儿能好，但当下不该再打。 */
-const THROTTLE_CODES = new Set(['RATE_LIMIT', 'QUOTA', 'ACCOUNT_QUOTA', 'RESOURCE_EXHAUSTED'])
+/** 限流：等一会儿能好，但当下不该再打。 */
+const THROTTLE_CODES = new Set(['RATE_LIMIT', 'RESOURCE_EXHAUSTED'])
+
+/**
+ * 额度类机器码：与「限流」分开。
+ *
+ * ACCOUNT_QUOTA 是宿主对「账号额度用尽」的归一化码（上游原文多为余额不足/欠费），
+ * 判成 throttled 会让它进 30 分钟指数冷却，充了值也要干等；这里升级成 quota，
+ * 由 transitions.js 的 quotaCooldown 按成因分档冷却。
+ */
+const QUOTA_CODES = new Set(['QUOTA', 'ACCOUNT_QUOTA'])
 
 /** 传输层短暂故障：冷却后复检。 */
 const TRANSIENT_CODES = new Set(['SERVER', 'TIMEOUT', 'TRANSPORT', 'NETWORK', 'OVERLOADED', 'UNAVAILABLE'])
@@ -161,12 +170,21 @@ export function classifyFailure(failure) {
 
   if (code === 'ABORTED') return VERDICT.aborted
   if (AUTH_CODES.has(code)) return VERDICT.auth
+  if (QUOTA_CODES.has(code)) return VERDICT.quota
   if (THROTTLE_CODES.has(code)) return VERDICT.throttled
   if (EMPTY_CODES.has(code)) return VERDICT.empty
   if (TRANSIENT_CODES.has(code)) return code === 'TIMEOUT' ? VERDICT.timeout : VERDICT.unavailable
   if (REQUEST_SCOPE_CODES.has(code)) return VERDICT.unavailable
 
   const byText = classifyByText(`${code} ${message}`.trim())
+  // 文案里认得出「余额/欠费/到期」时，一律升级为 quota —— 限流是个更弱的判断，
+  // 认错方向的代价是把一个要充值的通道当抖动反复重试。
+  if (byText === VERDICT.throttled) {
+    const cause = classifyQuotaCause(message, code)
+    if (cause === QUOTA_CAUSE.balance || cause === QUOTA_CAUSE.payment || cause === QUOTA_CAUSE.expired) {
+      return VERDICT.quota
+    }
+  }
   if (byText) return byText
 
   // 归一化后的 UNKNOWN：仍然算一次失败，但保留 unknown 以便面板区分“真不明”与“确知不可用”。
@@ -204,4 +222,60 @@ export function classifyOutcome(outcome) {
   if (outcome.finishKind === 'error') return VERDICT.unknown
   if (!outcome.sawContent) return VERDICT.empty
   return VERDICT.ok
+}
+
+/**
+ * 额度类失败的成因标签。
+ *
+ * 为什么必须分：这些失败的**恢复方式完全不同** —— 余额为 0 只能等用户充值，
+ * 单窗口限流几十秒就回来了，免费额度到期要等下一次发放。全都按「6 小时冷却」
+ * 处理，结果是充值后还要干等 6 小时；全都按「30 分钟」处理，余额为 0 的通道
+ * 会被每半小时拉出来白打一次（线上实测 zhipu 被推到 failCount=197，把整池
+ * 的冷却水位占满 → 用户看到「28 个冷却中，一次都未尝试」）。
+ *
+ * @readonly
+ */
+export const QUOTA_CAUSE = Object.freeze({
+  /** 账户余额为 0 / 欠费 / 无可用资源包。需要充值，等多久都不会自己好。 */
+  balance: 'balance',
+  /** 402 Payment Required 一类：语义同余额，但保留独立标签便于统计。 */
+  payment: 'payment',
+  /** 免费额度已到期 / 已失效。要等下一轮发放或重新领取。 */
+  expired: 'expired',
+  /** 单日/单窗口/每分钟限流。分钟级就能恢复。 */
+  rate: 'rate',
+  /** 只知道是额度类，认不出成因。 */
+  unknown: 'unknown'
+})
+
+/** 成因优先级：同一段文案命中多条时，按「越难自愈越优先」取第一条。 */
+const QUOTA_CAUSE_PATTERNS = [
+  { cause: QUOTA_CAUSE.balance, re: /(?:余额不足|欠费|请充值|充值后|无可用资源包|资源包(?:已)?用完|积分不足|免费额度已用完|额度已用完)/ },
+  {
+    cause: QUOTA_CAUSE.balance,
+    re: /\b(?:insufficient|out\s+of)\s+(?:balance|credits?|funds?|quota)\b|\bbalance\s+is\s+insufficient\b|\barrears\b|\btop\s?up\b/i
+  },
+  { cause: QUOTA_CAUSE.payment, re: /\b402\b|\bpayment\s+required\b/ },
+  { cause: QUOTA_CAUSE.expired, re: /(?:额度|配额|资源包)(?:已)?(?:到期|过期|失效)|(?:到期|过期)的?免费额度/ },
+  { cause: QUOTA_CAUSE.expired, re: /\b(?:quota|credits?|free\s+tier)\b[^.]{0,24}\b(?:expired|expir(?:es|ed|ing))\b/i },
+  {
+    cause: QUOTA_CAUSE.rate,
+    re: /\b(?:tpm|rpm|rpd|qps|qpm)\b|\brate[\s_-]?limit|\btoo\s+many\s+requests\b|\bthrottl|\bexceeds?\b[^.]{0,32}\blimit\b/i
+  },
+  { cause: QUOTA_CAUSE.rate, re: /(?:单日|每日|当日|每分钟|每窗口)(?:请求)?(?:次数)?(?:上限|超限|限流|额度)|窗口限流/ }
+]
+
+/**
+ * 认一次额度类失败的成因。
+ *
+ * @param {string} [text] - 上游原文（message / detail / body）
+ * @param {string} [code] - 机器码（LlmFailure.code 或上游业务码，如 1113）
+ * @returns {keyof typeof QUOTA_CAUSE}
+ */
+export function classifyQuotaCause(text = '', code = '') {
+  const haystack = `${code} ${text}`.trim()
+  // 智谱的 1113 = 「余额不足或无可用资源包，请充值」；出现在 code 位时直接判余额。
+  if (/\b1113\b/.test(String(code)) || /(?:^|\s)1113(?:\s|$)/.test(haystack)) return QUOTA_CAUSE.balance
+  for (const { cause, re } of QUOTA_CAUSE_PATTERNS) if (re.test(haystack)) return cause
+  return QUOTA_CAUSE.unknown
 }

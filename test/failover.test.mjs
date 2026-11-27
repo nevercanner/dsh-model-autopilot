@@ -245,7 +245,7 @@ test('minimax-cn 额度耗尽：不重试，直接切下一个候选', async () 
   // 额度类失败（QUOTA → throttled）不重试：minimax-cn 只被调用一次。
   assert.deepEqual(llm.calls, ['minimax-cn/m1', 'magpie/paid-x'])
   assert.equal(result.attempts[0].key, 'minimax-cn/m1')
-  assert.equal(result.attempts[0].verdict, 'throttled')
+  assert.equal(result.attempts[0].verdict, 'quota')
   assert.equal(result.attempts[0].retry, 0)
   assert.equal(result.attempts.length, 2, '两次尝试：minimax-cn 一次 + 备用一次')
 })
@@ -263,7 +263,7 @@ test('首帧是 usage、随后 error finish：必须切换（额度耗尽的真�
   const result = await failover.run({ messages: [] })
   assert.equal(result.model.key, 'our-free-model/free-b', '不能把 usage 当成成功首帧')
   assert.deepEqual(llm.calls, ['our-free-model/free-a', 'our-free-model/free-b'])
-  assert.equal(result.attempts[0].verdict, 'throttled')
+  assert.equal(result.attempts[0].verdict, 'quota')
   assert.equal(pool.get('our-free-model/free-a').failCount, 1)
 })
 

@@ -338,7 +338,7 @@ test('首选模型额度耗尽：不重试，直接切下一个候选', async ()
   const result = await failover.run({ messages: [] })
   assert.equal(result.model.key, 'our-free-model/free-a')
   assert.deepEqual(llm.calls, ['minimax-cn/MiniMax-M3', 'our-free-model/free-a'])
-  assert.equal(result.attempts[0].verdict, 'throttled')
+  assert.equal(result.attempts[0].verdict, 'quota')
 })
 
 // ── 边界 ─────────────────────────────────────────────────────────────────────
